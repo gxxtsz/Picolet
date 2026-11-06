@@ -120,8 +120,72 @@ void TestAnnotations() {
 
     Check(history.Undo(frame) == S_OK && SUCCEEDED(history.Render(frame, frame.bounds, composed)) &&
           std::ranges::equal(composed.pixels(), annotated.pixels()), "撤销马赛克没有恢复上一笔");
+    Check(history.Redo(frame) == S_OK && SUCCEEDED(history.Render(frame, frame.bounds, composed)) &&
+          composed.pixels()[6 * 24 + 4] == average && !history.can_redo(), "重做马赛克没有按原顺序合成");
+    Check(history.Undo(frame) == S_OK, "重做后无法再次撤销");
     Check(history.Undo(frame) == S_OK && history.empty() && SUCCEEDED(history.Render(frame, frame.bounds, composed)) &&
           std::ranges::equal(composed.pixels(), frame.image.pixels()), "撤销所有标注没有恢复原图");
+}
+
+void TestShapeAnnotations() {
+    DesktopFrame frame;
+    frame.bounds = {-16, -14, 16, 16};
+    Check(SUCCEEDED(frame.image.Resize(32, 30)), "创建形状测试帧失败");
+    constexpr auto base = 0xff303030u;
+    std::ranges::fill(frame.image.pixels(), base);
+    AnnotationHistory history;
+    const auto make = [&](EditTool tool, POINT first, POINT last, COLORREF color, bool filled = false) {
+        Annotation mark;
+        mark.tool = tool;
+        mark.clip = frame.bounds;
+        mark.first = first;
+        mark.last = last;
+        mark.color = color;
+        mark.width = 3;
+        mark.filled = filled;
+        return mark;
+    };
+    const auto pixel = [&](const Image& image, LONG x, LONG y) {
+        const auto row = static_cast<std::size_t>(y - frame.bounds.top);
+        return image.pixels()[row * image.width() + (x - frame.bounds.left)];
+    };
+    auto outline = make(EditTool::Rectangle, {-12, -10}, {2, 4}, RGB(255, 0, 0));
+    Check(history.Commit(frame, std::move(outline)) == S_OK, "无法绘制描边矩形");
+    Image outlined;
+    Check(history.Render(frame, frame.bounds, outlined) == S_OK &&
+          pixel(outlined, -5, -10) == 0xffff0000 && pixel(outlined, -5, -3) == base,
+          "描边矩形边缘颜色或内部像素错误");
+
+    auto solid = make(EditTool::Rectangle, {-12, -10}, {2, 4}, RGB(0, 255, 0), true);
+    solid.clip.right = -3;
+    Check(history.Commit(frame, std::move(solid)) == S_OK, "无法绘制实心矩形");
+    Check(history.Commit(frame, make(EditTool::Ellipse, {5, -10}, {14, 4}, RGB(0, 0, 255), true)) == S_OK,
+          "无法绘制实心椭圆");
+    Check(history.Commit(frame, make(EditTool::Line, {10, 10}, {-10, 10}, RGB(255, 255, 255))) == S_OK,
+          "无法绘制反向直线");
+    Image all;
+    Check(history.Render(frame, frame.bounds, all) == S_OK &&
+          pixel(all, -5, -3) == 0xff00ff00 && pixel(all, -3, -3) == base &&
+          pixel(all, 9, -3) == 0xff0000ff && pixel(all, 5, -10) == base &&
+          pixel(all, 0, 10) == 0xffffffff && pixel(all, 0, 7) == base,
+          "实心形状、选区裁剪或直线的导出像素错误");
+
+    // 失败的提交和重做不能损坏已撤销的分支。成功的新标注则应替换分支。
+    Check(history.Undo(frame) == S_OK && history.can_redo(), "撤销后未保留可重做的直线");
+    DesktopFrame broken;
+    broken.bounds = frame.bounds;
+    Check(FAILED(history.Redo(broken)) && history.can_redo(), "重做失败后丢失历史");
+    Check(FAILED(history.Commit(broken, make(EditTool::Line, {-4, 5}, {4, 5}, RGB(255, 0, 0)))) &&
+          history.can_redo(), "提交失败后丢失重做分支");
+    Image replayed;
+    Check(history.Redo(frame) == S_OK && history.Render(frame, frame.bounds, replayed) == S_OK &&
+          std::ranges::equal(all.pixels(), replayed.pixels()), "重做后的标注像素不一致");
+    Check(history.Undo(frame) == S_OK &&
+          history.Commit(frame, make(EditTool::Line, {-4, 5}, {4, 5}, RGB(255, 0, 0))) == S_OK &&
+          !history.can_redo() && history.Redo(frame) == S_FALSE, "新标注没有清除重做分支");
+    Check(history.Undo(frame) == S_OK && history.can_redo(), "清空历史前未生成重做分支");
+    history.Clear();
+    Check(history.empty() && !history.can_redo(), "重选后仍然保留了标注历史");
 }
 
 void TestShortcuts() {
@@ -149,6 +213,23 @@ void TestShortcuts() {
     Check(DecodeBindings(EncodeBindings(migrated), {}) == defaults, "损坏的设置没有回退到默认值");
     migrated[0] = {0, VK_F12};
     Check(ValidateBindings(migrated).error == ShortcutError::Reserved, "全局快捷键接受了系统保留的 F12");
+
+    // 用旧版的实际字段顺序验证升级，包含显式清除和跨作用域复用。
+    std::array<WORD, 8> v1{{1, MAKEWORD('Y', MOD_CONTROL), MAKEWORD('A', MOD_CONTROL), 0,
+                           MAKEWORD('S', MOD_CONTROL), MAKEWORD('T', MOD_CONTROL),
+                           MAKEWORD('Z', MOD_CONTROL), VK_ESCAPE}};
+    const Hotkey redo{MOD_CONTROL, 'Y'};
+    auto upgraded = DecodeBindings(v1, old);
+    Check(upgraded[0] == redo && upgraded[ShortcutIndex(Shortcut::Copy)] == Hotkey{} &&
+          MatchLocalShortcut(upgraded, redo) == Shortcut::Redo, "旧版绑定迁移或默认重做键错误");
+    v1[ShortcutIndex(Shortcut::Copy) + 1] = MAKEWORD('Y', MOD_CONTROL);
+    upgraded = DecodeBindings(v1, old);
+    Check(upgraded[ShortcutIndex(Shortcut::Redo)] == Hotkey{} && MatchLocalShortcut(upgraded, redo) == Shortcut::Copy &&
+          DecodeBindings(EncodeBindings(upgraded), old) == upgraded, "重做默认键覆盖旧配置或恢复了已清除的绑定");
+    upgraded[ShortcutIndex(Shortcut::Redo)] = redo;
+    const auto redoConflict = ValidateBindings(upgraded);
+    Check(redoConflict.error == ShortcutError::Duplicate && redoConflict.slot == Shortcut::Redo,
+          "没有报告自定义重做快捷键冲突");
 }
 
 // 通过系统解码器读取实际写出的文件，检测像素通道、透明度、行方向和尺寸的错误。
@@ -225,6 +306,7 @@ int main() {
         TestCrop();
         TestSelectionAdjustments();
         TestAnnotations();
+        TestShapeAnnotations();
         TestShortcuts();
         TestPng();
     } catch (const std::exception& error) {

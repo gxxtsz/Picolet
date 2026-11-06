@@ -2,9 +2,8 @@
 
 #include "capture_edit.h"
 #include "hotkeys.h"
+#include "toolbar.h"
 #include "win32.h"
-
-#include <array>
 
 namespace picolet {
 
@@ -40,13 +39,6 @@ public:
     const RECT& selection() const noexcept { return selection_; }
 
 private:
-    enum Button : std::size_t {
-        BSelect, BRectangle, BEllipse, BArrow, BPen, BText, BMosaic,
-        BRed, BYellow, BGreen, BBlue, BWhite, BBlack, BSize,
-        BReselect, BFullscreen, BUndo, BCopy, BSave, BPin, BCancel, BCount
-    };
-    struct ButtonSpec { const wchar_t* label; int width; };
-    static const std::array<ButtonSpec, BCount> kButtons;
     enum class Drag { None, Create, Move, Resize, Mark };
 
     static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) noexcept;
@@ -54,9 +46,9 @@ private:
                                      UINT_PTR id, DWORD_PTR data) noexcept;
     LRESULT Handle(UINT message, WPARAM wparam, LPARAM lparam) noexcept;
 
-    bool CreateButtons(HINSTANCE instance) noexcept;
     void Command(Shortcut shortcut) noexcept;
-    void PressButton(Button button) noexcept;
+    void PressButton(ToolbarButton button) noexcept;
+    void AdjustSize() noexcept;
     void PostAction(OverlayAction action) noexcept;
     void SelectFullscreen() noexcept;
     void BeginDrag(POINT point) noexcept;
@@ -67,39 +59,35 @@ private:
     Annotation MakeMark(POINT point) const noexcept;
     void BeginText(POINT point) noexcept;
     bool FinishText(bool commit) noexcept;
+    void UpdateTextStyle() noexcept;
 
     RECT ToClient(RECT rect) const noexcept;
     POINT MessagePoint() const noexcept;
     void LayoutPanel() noexcept;
-    void HidePanel() noexcept;
     void Status(const wchar_t* text) noexcept;
     void RepaintSelection(const RECT& previous) noexcept;
     void Paint() noexcept;
-    void PaintButton(const DRAWITEMSTRUCT& item) const noexcept;
 
     HWND window_ = nullptr;
     HWND owner_ = nullptr;
     HWND textEdit_ = nullptr;
-    std::array<HWND, BCount> buttons_{};
+    CaptureToolbar toolbar_;
     const DesktopFrame* frame_ = nullptr;
     ShortcutBindings shortcuts_{};
     Image dark_;
     AnnotationHistory history_;
     Annotation draft_;
-    FontHandle font_;
     FontHandle textFont_;
     UINT dpi_ = USER_DEFAULT_SCREEN_DPI;
-    RECT panel_{};
     RECT selection_{};
     RECT original_{};
     POINT anchor_{};
     POINT start_{};
     unsigned edges_ = EdgeNone;
     EditTool tool_ = EditTool::Select;
+    EditTool shape_ = EditTool::Rectangle;
     Drag drag_ = Drag::None;
-    std::size_t color_ = 0;
-    std::size_t strokeSize_ = 1;
-    std::size_t textSize_ = 1;
+    ToolbarStyle style_;
     const wchar_t* status_ = nullptr;
     bool activated_ = false;
     bool invalidated_ = false;
@@ -107,6 +95,7 @@ private:
     bool busy_ = false;
     bool closing_ = false;
     bool composingText_ = false;
+    bool paletteOpen_ = false;
 };
 
 }  // namespace picolet

@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <type_traits>
 
 namespace picolet {
 namespace {
@@ -24,11 +25,15 @@ RECT DragBounds(POINT first, POINT last) noexcept {
             std::max(first.x, last.x) + 1, std::max(first.y, last.y) + 1};
 }
 
+bool SolidShape(const Annotation& mark) noexcept {
+    return mark.filled && (mark.tool == EditTool::Rectangle || mark.tool == EditTool::Ellipse);
+}
+
 RECT InkBounds(const Annotation& mark) noexcept {
     RECT rect = DragBounds(mark.first, mark.last);
     if (mark.tool == EditTool::Text) {
         rect = {mark.first.x, mark.first.y, mark.clip.right, mark.clip.bottom};
-    } else if (mark.tool != EditTool::Mosaic) {
+    } else if (mark.tool != EditTool::Mosaic && !SolidShape(mark)) {
         for (const auto point : mark.path) {
             rect.left = std::min(rect.left, point.x);
             rect.top = std::min(rect.top, point.y);
@@ -76,6 +81,19 @@ bool DrawMark(HDC dc, const Annotation& mark, POINT origin) noexcept {
             return ok;
         }
 
+        if (SolidShape(mark)) {
+            const BrushHandle fill(CreateSolidBrush(mark.color));
+            const RECT rect = DragBounds(mark.first, mark.last);
+            ok = fill && SelectObject(dc, fill.get()) && SelectObject(dc, GetStockObject(NULL_PEN));
+            if (ok) {
+                ok = mark.tool == EditTool::Rectangle
+                    ? Rectangle(dc, rect.left, rect.top, rect.right, rect.bottom) != FALSE
+                    : Ellipse(dc, rect.left, rect.top, rect.right, rect.bottom) != FALSE;
+            }
+            RestoreDC(dc, saved);
+            return ok;
+        }
+
         const LOGBRUSH style{BS_SOLID, mark.color, 0};
         const PenHandle pen(mark.tool == EditTool::Mosaic
             ? CreatePen(PS_DOT, 1, RGB(245, 245, 245))
@@ -90,6 +108,11 @@ bool DrawMark(HDC dc, const Annotation& mark, POINT origin) noexcept {
             case EditTool::Ellipse:
                 ok = Ellipse(dc, rect.left, rect.top, rect.right, rect.bottom) != FALSE;
                 break;
+            case EditTool::Line: {
+                const POINT points[]{mark.first, mark.last};
+                ok = Polyline(dc, points, 2) != FALSE;
+                break;
+            }
             case EditTool::Pen:
                 ok = Polyline(dc, mark.path.data(), static_cast<int>(mark.path.size())) != FALSE;
                 break;
@@ -198,36 +221,58 @@ HRESULT AnnotationHistory::Commit(const DesktopFrame& frame, Annotation&& mark) 
     const RECT ink = InkBounds(mark);
     RECT visible{};
     if (!IntersectRect(&visible, &ink, &frame.bounds)) return S_FALSE;
+    if (applied_ == marks_.max_size()) return E_OUTOFMEMORY;
     try {
-        marks_.push_back(std::move(mark));
+        // 在修改合成图之前准备空间。撤销过时，原有尾部已经为新的一笔预留了容量。
+        if (applied_ == marks_.capacity()) {
+            const auto remaining = marks_.max_size() - applied_;
+            marks_.reserve(applied_ + std::min(remaining, std::max<std::size_t>(1, applied_)));
+        }
     } catch (...) {
         return E_OUTOFMEMORY;
     }
-    const auto status = Rebuild(frame, marks_.size());
-    if (FAILED(status)) marks_.pop_back();
+    const auto status = Rebuild(frame, applied_, &mark);
+    if (SUCCEEDED(status)) {
+        static_assert(std::is_nothrow_move_constructible_v<Annotation>);
+        marks_.resize(applied_);
+        marks_.push_back(std::move(mark));
+        ++applied_;
+    }
     return status;
 }
 
 HRESULT AnnotationHistory::Undo(const DesktopFrame& frame) noexcept {
-    if (marks_.empty()) return S_FALSE;
-    const auto status = Rebuild(frame, marks_.size() - 1);
-    if (SUCCEEDED(status)) marks_.pop_back();
+    if (empty()) return S_FALSE;
+    const auto status = Rebuild(frame, applied_ - 1);
+    if (SUCCEEDED(status)) --applied_;
+    return status;
+}
+
+HRESULT AnnotationHistory::Redo(const DesktopFrame& frame) noexcept {
+    if (!can_redo()) return S_FALSE;
+    const auto status = Rebuild(frame, applied_ + 1);
+    if (SUCCEEDED(status)) ++applied_;
     return status;
 }
 
 void AnnotationHistory::Clear() noexcept {
     marks_.clear();
+    applied_ = 0;
     patch_ = {};
 }
 
-HRESULT AnnotationHistory::Rebuild(const DesktopFrame& frame, std::size_t count) noexcept {
-    if (count == 0) {
+HRESULT AnnotationHistory::Rebuild(const DesktopFrame& frame, std::size_t count, const Annotation* pending) noexcept {
+    const auto total = count + (pending ? 1 : 0);
+    if (total == 0) {
         patch_ = {};
         return S_OK;
     }
+    const auto markAt = [&](std::size_t i) -> const Annotation& {
+        return i < count ? marks_[i] : *pending;
+    };
     DesktopFrame patch;
-    for (std::size_t i = 0; i < count; ++i) {
-        const RECT ink = InkBounds(marks_[i]);
+    for (std::size_t i = 0; i < total; ++i) {
+        const RECT ink = InkBounds(markAt(i));
         UnionRect(&patch.bounds, &patch.bounds, &ink);
     }
     IntersectRect(&patch.bounds, &patch.bounds, &frame.bounds);
@@ -248,8 +293,8 @@ HRESULT AnnotationHistory::Rebuild(const DesktopFrame& frame, std::size_t count)
     // 马赛克按提交顺序处理已画好的像素。必须先等待 GDI 批处理写入 DIB，再由 CPU 读取。
     bool ok = true;
     const POINT origin{patch.bounds.left, patch.bounds.top};
-    for (std::size_t i = 0; ok && i < count; ++i) {
-        const auto& mark = marks_[i];
+    for (std::size_t i = 0; ok && i < total; ++i) {
+        const auto& mark = markAt(i);
         if (mark.tool == EditTool::Mosaic) {
             RECT rect = InkBounds(mark);
             if (IntersectRect(&rect, &rect, &patch.bounds)) {

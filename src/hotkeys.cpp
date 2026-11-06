@@ -10,9 +10,10 @@ namespace {
 constexpr wchar_t kRegistryKey[] = L"Software\\Picolet\\Screenshot";
 constexpr wchar_t kRegistryValue[] = L"Shortcuts";
 constexpr wchar_t kLegacyValue[] = L"Hotkeys";
-constexpr WORD kBindingVersion = 1;
+constexpr WORD kBindingVersion = 2;
+constexpr auto kV1Count = ShortcutIndex(Shortcut::Redo);
 constexpr ShortcutBindings kDefaults{{{0, VK_F1}, {MOD_CONTROL, 'A'}, {MOD_CONTROL, 'C'},
-    {MOD_CONTROL, 'S'}, {MOD_CONTROL, 'T'}, {MOD_CONTROL, 'Z'}, {0, VK_ESCAPE}}};
+    {MOD_CONTROL, 'S'}, {MOD_CONTROL, 'T'}, {MOD_CONTROL, 'Z'}, {0, VK_ESCAPE}, {MOD_CONTROL, 'Y'}}};
 
 Hotkey Decode(WORD word) noexcept { return {HIBYTE(word), LOBYTE(word)}; }
 
@@ -28,12 +29,14 @@ ShortcutBindings LoadBindings() noexcept {
     ShortcutWords words{};
     DWORD size = static_cast<DWORD>(sizeof(words));
     const bool hasWords = RegGetValueW(HKEY_CURRENT_USER, kRegistryKey, kRegistryValue, RRF_RT_REG_BINARY,
-                                       nullptr, words.data(), &size) == ERROR_SUCCESS && size == sizeof(words);
+                                       nullptr, words.data(), &size) == ERROR_SUCCESS &&
+                          size <= sizeof(words) && size % sizeof(WORD) == 0;
+    const auto sizeWords = size / sizeof(WORD);
     DWORD legacy = 0;
     size = sizeof(legacy);
     const bool hasLegacy = RegGetValueW(HKEY_CURRENT_USER, kRegistryKey, kLegacyValue, RRF_RT_REG_DWORD,
                                        nullptr, &legacy, &size) == ERROR_SUCCESS && size == sizeof(legacy);
-    return DecodeBindings(hasWords ? std::span<const WORD>(words) : std::span<const WORD>{},
+    return DecodeBindings(hasWords ? std::span<const WORD>(words.data(), sizeWords) : std::span<const WORD>{},
                           hasLegacy ? std::optional<DWORD>(legacy) : std::nullopt);
 }
 
@@ -50,7 +53,7 @@ bool SaveBindings(const ShortcutBindings& bindings) noexcept {
 }  // namespace
 
 const wchar_t* ShortcutName(Shortcut command) noexcept {
-    constexpr const wchar_t* names[]{L"开始截图", L"全屏", L"复制", L"另存为 PNG", L"贴图", L"撤销", L"取消"};
+    constexpr const wchar_t* names[]{L"开始截图", L"全屏", L"复制", L"另存为 PNG", L"贴图", L"撤销", L"取消", L"重做"};
     const auto index = ShortcutIndex(command);
     return index < kShortcutCount ? names[index] : L"";
 }
@@ -154,6 +157,15 @@ ShortcutBindings DecodeBindings(std::span<const WORD> words, std::optional<DWORD
         ShortcutBindings bindings{};
         for (std::size_t i = 0; i < bindings.size(); ++i) bindings[i] = Decode(words[i + 1]);
         if (ValidateBindings(bindings).error == ShortcutError::None) return bindings;
+    }
+    if (words.size() == kV1Count + 1 && words.front() == 1) {
+        ShortcutBindings bindings{};
+        for (std::size_t i = 0; i < kV1Count; ++i) bindings[i] = Decode(words[i + 1]);
+        if (ValidateBindings(bindings).error == ShortcutError::None) {
+            const Hotkey redo = kDefaults[ShortcutIndex(Shortcut::Redo)];
+            if (!MatchLocalShortcut(bindings, redo)) bindings[ShortcutIndex(Shortcut::Redo)] = redo;
+            return bindings;
+        }
     }
     ShortcutBindings bindings = kDefaults;
     if (legacy) {

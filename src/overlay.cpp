@@ -6,23 +6,14 @@
 
 #include <algorithm>
 #include <cstdlib>
-#include <cwchar>
-#include <limits>
 
 namespace picolet {
 namespace {
 
 constexpr wchar_t kOverlayClass[] = L"Picolet.SelectionOverlay";
-constexpr int kButtonBase = 4000;
 constexpr int kTextLimit = 2048;
-constexpr int kWidths[]{2, 4, 8};
-constexpr int kTextSizes[]{16, 24, 36};
-constexpr COLORREF kColors[]{RGB(239, 68, 68), RGB(250, 204, 21), RGB(74, 222, 128),
-                             RGB(59, 130, 246), RGB(255, 255, 255), RGB(15, 23, 42)};
 constexpr COLORREF kAccent = RGB(62, 230, 193);
-constexpr COLORREF kPanel = RGB(20, 29, 43);
-constexpr COLORREF kPanelBorder = RGB(61, 77, 96);
-constexpr COLORREF kText = RGB(241, 245, 249);
+constexpr COLORREF kGripBorder = RGB(20, 29, 43);
 
 void Fill(HDC dc, const RECT& rect, COLORREF color) noexcept {
     SetDCBrushColor(dc, color);
@@ -37,12 +28,6 @@ void Border(HDC dc, const RECT& rect, COLORREF color) noexcept {
 bool SamePoint(POINT a, POINT b) noexcept { return a.x == b.x && a.y == b.y; }
 
 }  // namespace
-
-const std::array<SelectionOverlay::ButtonSpec, SelectionOverlay::BCount> SelectionOverlay::kButtons{{
-    {L"选区", 46}, {L"矩形", 46}, {L"椭圆", 46}, {L"箭头", 46}, {L"画笔", 46}, {L"文字", 46}, {L"马赛克", 60},
-    {L"红色", 21}, {L"黄色", 21}, {L"绿色", 21}, {L"蓝色", 21}, {L"白色", 21}, {L"黑色", 21}, {L"线宽", 68},
-    {L"重选", 46}, {L"全屏", 46}, {L"撤销", 46}, {L"复制", 46}, {L"另存为 PNG", 90}, {L"贴图", 46}, {L"取消", 46},
-}};
 
 bool SelectionOverlay::Register(HINSTANCE instance, HICON icon) noexcept {
     WNDCLASSEXW definition{};
@@ -68,17 +53,17 @@ HRESULT SelectionOverlay::Open(HINSTANCE instance, HWND owner, const DesktopFram
     owner_ = owner;
     shortcuts_ = shortcuts;
     anchor_ = anchor;
-    selection_ = panel_ = {};
+    selection_ = {};
     tool_ = EditTool::Select;
     drag_ = Drag::None;
     status_ = nullptr;
-    activated_ = invalidated_ = pending_ = busy_ = closing_ = composingText_ = false;
+    activated_ = invalidated_ = pending_ = busy_ = closing_ = composingText_ = paletteOpen_ = false;
 
     const auto& bounds = frame.bounds;
     const HWND window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, kOverlayClass, L"Picolet 截图",
                                         WS_POPUP | WS_CLIPCHILDREN, bounds.left, bounds.top,
                                         image.width(), image.height(), owner, nullptr, instance, this);
-    if (!window || !CreateButtons(instance)) {
+    if (!window || !toolbar_.Create(window, instance, shortcuts)) {
         const HRESULT error = LastErrorResult();
         Close();
         return error;
@@ -94,15 +79,6 @@ HRESULT SelectionOverlay::Open(HINSTANCE instance, HWND owner, const DesktopFram
     return S_OK;
 }
 
-bool SelectionOverlay::CreateButtons(HINSTANCE instance) noexcept {
-    for (std::size_t i = 0; i < buttons_.size(); ++i) {
-        buttons_[i] = CreateWindowExW(0, L"BUTTON", kButtons[i].label, WS_CHILD | WS_TABSTOP | BS_OWNERDRAW,
-                                      0, 0, 0, 0, window_, reinterpret_cast<HMENU>(kButtonBase + i), instance, nullptr);
-        if (!buttons_[i]) return false;
-    }
-    return true;
-}
-
 void SelectionOverlay::Cancel() noexcept {
     if (!window_ || closing_) return;
     invalidated_ = true;
@@ -112,14 +88,13 @@ void SelectionOverlay::Cancel() noexcept {
 void SelectionOverlay::Close() noexcept {
     closing_ = true;
     drag_ = Drag::None;
+    toolbar_.Close();
     if (window_) {
         if (GetCapture() == window_) ReleaseCapture();
         DestroyWindow(window_);
     }
     textEdit_ = nullptr;
-    buttons_.fill(nullptr);
     textFont_.reset();
-    font_.reset();
     frame_ = nullptr;
     dark_ = {};
     history_.Clear();
@@ -128,7 +103,8 @@ void SelectionOverlay::Close() noexcept {
 
 void SelectionOverlay::BeginOutput() noexcept {
     busy_ = true;
-    HidePanel();
+    paletteOpen_ = false;
+    toolbar_.Hide();
 }
 
 void SelectionOverlay::Retry(const wchar_t* status) noexcept {
@@ -144,21 +120,39 @@ HRESULT SelectionOverlay::Render(Image& result) const noexcept {
 }
 
 bool SelectionOverlay::HandleKey(const MSG& message) noexcept {
-    if (!window_ || (message.hwnd != window_ && !IsChild(window_, message.hwnd)) || textEdit_ || busy_ || pending_)
+    if (!window_ || (message.hwnd != window_ && !IsChild(window_, message.hwnd)) ||
+        message.hwnd == textEdit_ || busy_ || pending_)
         return false;
     const bool down = message.message == WM_KEYDOWN || message.message == WM_SYSKEYDOWN;
     const bool snapshotUp = (message.message == WM_KEYUP || message.message == WM_SYSKEYUP) && message.wParam == VK_SNAPSHOT;
     if (!down && !snapshotUp) return false;
     if (down && message.wParam == VK_SNAPSHOT) return false;
     const auto mods = CurrentModifiers();
-    if (const auto shortcut = MatchLocalShortcut(shortcuts_, {mods, static_cast<UINT>(message.wParam)})) {
-        if (!(down && (HIWORD(message.lParam) & KF_REPEAT)) && (drag_ == Drag::None || *shortcut == Shortcut::Cancel))
-            Command(*shortcut);
+    const bool repeat = down && (HIWORD(message.lParam) & KF_REPEAT);
+    if (down && !mods && toolbar_.IsSlider(message.hwnd)) {
+        switch (message.wParam) {
+        case VK_LEFT: case VK_RIGHT: case VK_UP: case VK_DOWN:
+        case VK_HOME: case VK_END: case VK_PRIOR: case VK_NEXT:
+            return false;
+        }
+    }
+    if (!textEdit_) {
+        if (const auto shortcut = MatchLocalShortcut(shortcuts_, {mods, static_cast<UINT>(message.wParam)})) {
+            if (!repeat && (drag_ == Drag::None || *shortcut == Shortcut::Cancel)) Command(*shortcut);
+            return true;
+        }
+    } else if (down && ((message.wParam == VK_ESCAPE && !mods) ||
+                        (message.wParam == VK_RETURN && mods == MOD_CONTROL))) {
+        if (!repeat && !composingText_) FinishText(message.wParam == VK_RETURN);
         return true;
     }
     if (down && message.wParam == VK_TAB && !(mods & ~MOD_SHIFT) && drag_ == Drag::None) {
         const HWND current = message.hwnd == window_ ? nullptr : message.hwnd;
         if (const HWND next = GetNextDlgTabItem(window_, current, (mods & MOD_SHIFT) != 0)) SetFocus(next);
+        return true;
+    }
+    if (down && message.wParam == VK_RETURN && !mods && toolbar_.IsButton(message.hwnd)) {
+        if (!repeat) SendMessageW(message.hwnd, BM_CLICK, 0, 0);
         return true;
     }
     return false;
@@ -184,10 +178,26 @@ LRESULT SelectionOverlay::Handle(UINT message, WPARAM wparam, LPARAM lparam) noe
     case WM_ERASEBKGND: return 1;
     case WM_PAINT: Paint(); return 0;
     case WM_DRAWITEM:
-        if (const auto* item = reinterpret_cast<const DRAWITEMSTRUCT*>(lparam);
-            item->CtlID >= kButtonBase && item->CtlID < kButtonBase + BCount) {
-            PaintButton(*item);
-            return TRUE;
+        if (toolbar_.DrawButton(*reinterpret_cast<const DRAWITEMSTRUCT*>(lparam))) return TRUE;
+        break;
+    case WM_NOTIFY:
+        if (const auto result = toolbar_.DrawSlider(*reinterpret_cast<const NMHDR*>(lparam))) return *result;
+        break;
+    case WM_HSCROLL:
+        if (toolbar_.IsSlider(reinterpret_cast<HWND>(lparam))) {
+            if (!busy_ && !pending_) AdjustSize();
+            return 0;
+        }
+        break;
+    case WM_CTLCOLOREDIT:
+        if (textEdit_ && reinterpret_cast<HWND>(lparam) == textEdit_) {
+            // 让白色及亮色标注在输入时仍然可读，草稿最终只导出文字本身。
+            const auto color = draft_.color;
+            const bool light = GetRValue(color) * 299 + GetGValue(color) * 587 + GetBValue(color) * 114 >= 155000;
+            const auto dc = reinterpret_cast<HDC>(wparam);
+            SetTextColor(dc, color);
+            SetBkColor(dc, light ? RGB(0, 0, 0) : RGB(255, 255, 255));
+            return reinterpret_cast<LRESULT>(GetStockObject(light ? BLACK_BRUSH : WHITE_BRUSH));
         }
         break;
     case WM_ACTIVATE:
@@ -199,12 +209,16 @@ LRESULT SelectionOverlay::Handle(UINT message, WPARAM wparam, LPARAM lparam) noe
         }
         return 0;
     case WM_SETCURSOR:
+        if (toolbar_.IsButton(reinterpret_cast<HWND>(wparam)) || toolbar_.IsSlider(reinterpret_cast<HWND>(wparam))) {
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            return TRUE;
+        }
         if (reinterpret_cast<HWND>(wparam) == window_) {
             POINT cursor{};
             GetCursorPos(&cursor);
             LPCWSTR shape = IDC_CROSS;
             const POINT client{cursor.x - frame_->bounds.left, cursor.y - frame_->bounds.top};
-            if (!IsRectEmpty(&panel_) && PtInRect(&panel_, client)) {
+            if (toolbar_.Contains(client)) {
                 shape = IDC_ARROW;
             } else if (tool_ == EditTool::Select && !IsRectEmpty(&selection_)) {
                 const unsigned edges = drag_ == Drag::Resize ? edges_ : HitEdges(cursor);
@@ -221,16 +235,20 @@ LRESULT SelectionOverlay::Handle(UINT message, WPARAM wparam, LPARAM lparam) noe
         }
         break;
     case WM_COMMAND:
-        if (LOWORD(wparam) >= kButtonBase && LOWORD(wparam) < kButtonBase + BCount && HIWORD(wparam) == BN_CLICKED) {
-            if (!pending_ && !busy_) PressButton(static_cast<Button>(LOWORD(wparam) - kButtonBase));
+        if (const auto button = toolbar_.Clicked(wparam, lparam)) {
+            if (!pending_ && !busy_) PressButton(*button);
             return 0;
         }
         break;
     case WM_LBUTTONDOWN:
-        if (!busy_ && !pending_ && drag_ == Drag::None && FinishText(true)) {
+        if (!busy_ && !pending_ && drag_ == Drag::None) {
             const auto point = MessagePoint();
             const POINT client{point.x - frame_->bounds.left, point.y - frame_->bounds.top};
-            if (!PtInRect(&panel_, client)) BeginDrag(point);
+            if (!toolbar_.Contains(client)) {
+                const bool hadPalette = std::exchange(paletteOpen_, false);
+                if (FinishText(true)) BeginDrag(point);
+                if (hadPalette && drag_ == Drag::None) LayoutPanel();
+            }
         }
         return 0;
     case WM_MOUSEMOVE:
@@ -264,49 +282,89 @@ void SelectionOverlay::Command(Shortcut shortcut) noexcept {
     case Shortcut::Save: PostAction(OverlayAction::Save); break;
     case Shortcut::Pin: PostAction(OverlayAction::Pin); break;
     case Shortcut::Undo:
-        if (FAILED(history_.Undo(*frame_))) Status(L"无法撤销，请重试。");
-        else Status(nullptr);
+    case Shortcut::Redo: {
+        const bool undo = shortcut == Shortcut::Undo;
+        const auto result = undo ? history_.Undo(*frame_) : history_.Redo(*frame_);
+        status_ = FAILED(result) ? (undo ? L"无法撤销，请重试。" : L"无法重做，请重试。") : nullptr;
         RepaintSelection(selection_);
         LayoutPanel();
         break;
+    }
     case Shortcut::Cancel: Cancel(); break;
     default: break;
     }
 }
 
-void SelectionOverlay::PressButton(Button button) noexcept {
-    if (button == BCancel) {
+void SelectionOverlay::PressButton(ToolbarButton button) noexcept {
+    using Button = ToolbarButton;
+    if (button == Button::Cancel) {
         Cancel();
         return;
     }
-    if (!FinishText(true)) return;
+    // 修改样式时保留正在输入的文字。切换工具或输出时才提交草稿。
+    if (button == Button::Color) {
+        paletteOpen_ = !paletteOpen_;
+        LayoutPanel();
+        return;
+    }
+    if (button >= Button::Red && button <= Button::Black) {
+        style_.color = static_cast<std::size_t>(button) - static_cast<std::size_t>(Button::Red);
+        paletteOpen_ = false;
+        UpdateTextStyle();
+        LayoutPanel();
+        if (textEdit_) SetFocus(textEdit_);
+        return;
+    }
+    if (button == Button::Outline || button == Button::Solid) {
+        style_.filled = button == Button::Solid;
+        paletteOpen_ = false;
+        LayoutPanel();
+        return;
+    }
+    if (!FinishText(button != Button::Reselect)) return;
+    paletteOpen_ = false;
     status_ = nullptr;
-    if (button <= BMosaic) {
-        tool_ = static_cast<EditTool>(button);
-    } else if (button >= BRed && button <= BBlack) {
-        color_ = button - BRed;
-    } else if (button == BSize) {
-        auto& size = tool_ == EditTool::Text ? textSize_ : strokeSize_;
-        size = (size + 1) % std::size(kWidths);
-    } else if (button == BReselect) {
+    switch (button) {
+    case Button::Select: tool_ = EditTool::Select; break;
+    case Button::Shapes: tool_ = shape_; break;
+    case Button::Rectangle: tool_ = shape_ = EditTool::Rectangle; break;
+    case Button::Ellipse: tool_ = shape_ = EditTool::Ellipse; break;
+    case Button::Line: tool_ = shape_ = EditTool::Line; break;
+    case Button::Arrow: tool_ = EditTool::Arrow; break;
+    case Button::Pen: tool_ = EditTool::Pen; break;
+    case Button::Text: tool_ = EditTool::Text; break;
+    case Button::Mosaic: tool_ = EditTool::Mosaic; break;
+    case Button::Reselect: {
         const RECT previous = selection_;
         selection_ = {};
         tool_ = EditTool::Select;
         history_.Clear();
         GetCursorPos(&anchor_);
         RepaintSelection(previous);
-    } else {
-        switch (button) {
-        case BFullscreen: Command(Shortcut::Fullscreen); return;
-        case BUndo: Command(Shortcut::Undo); return;
-        case BCopy: Command(Shortcut::Copy); return;
-        case BSave: Command(Shortcut::Save); return;
-        case BPin: Command(Shortcut::Pin); return;
-        default: return;
-        }
+        break;
+    }
+    case Button::Fullscreen: Command(Shortcut::Fullscreen); return;
+    case Button::Undo: Command(Shortcut::Undo); return;
+    case Button::Redo: Command(Shortcut::Redo); return;
+    case Button::Copy: Command(Shortcut::Copy); return;
+    case Button::Save: Command(Shortcut::Save); return;
+    case Button::Pin: Command(Shortcut::Pin); return;
+    default: return;
     }
     LayoutPanel();
     RepaintSelection(selection_);
+}
+
+void SelectionOverlay::AdjustSize() noexcept {
+    const auto value = toolbar_.SliderValue();
+    if (tool_ == EditTool::Text) {
+        style_.textSize = std::clamp(value, ToolbarStyle::kMinTextSize, ToolbarStyle::kMaxTextSize);
+        UpdateTextStyle();
+        toolbar_.SetValue(style_.textSize);
+    } else {
+        style_.width = std::clamp(value, ToolbarStyle::kMinWidth, ToolbarStyle::kMaxWidth);
+        toolbar_.SetValue(style_.width);
+    }
 }
 
 void SelectionOverlay::PostAction(OverlayAction action) noexcept {
@@ -331,6 +389,7 @@ void SelectionOverlay::SelectFullscreen() noexcept {
     const auto previous = selection_;
     selection_ = selected;
     tool_ = EditTool::Select;
+    paletteOpen_ = false;
     status_ = nullptr;
     RepaintSelection(previous);
     LayoutPanel();
@@ -368,9 +427,10 @@ Annotation SelectionOverlay::MakeMark(POINT point) const noexcept {
     mark.tool = tool_;
     mark.first = mark.last = point;
     mark.clip = selection_;
-    mark.color = kColors[color_];
-    mark.width = kWidths[strokeSize_];
-    mark.textSize = kTextSizes[textSize_];
+    mark.color = kToolbarColors[style_.color];
+    mark.width = style_.width;
+    mark.textSize = style_.textSize;
+    mark.filled = style_.filled && (tool_ == EditTool::Rectangle || tool_ == EditTool::Ellipse);
     return mark;
 }
 
@@ -394,7 +454,7 @@ void SelectionOverlay::BeginDrag(POINT point) noexcept {
     if (drag_ != Drag::None) {
         status_ = nullptr;
         SetFocus(window_);
-        HidePanel();
+        toolbar_.Hide();
         SetCapture(window_);
         if (GetCapture() != window_) AbortDrag();
     }
@@ -476,6 +536,19 @@ void SelectionOverlay::BeginText(POINT point) noexcept {
     SetFocus(textEdit_);
 }
 
+void SelectionOverlay::UpdateTextStyle() noexcept {
+    if (!textEdit_) return;
+    draft_.color = kToolbarColors[style_.color];
+    if (style_.textSize != draft_.textSize) {
+        if (const HFONT font = CreateAnnotationFont(style_.textSize)) {
+            SendMessageW(textEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
+            textFont_.reset(font);
+            draft_.textSize = style_.textSize;
+        }
+    }
+    InvalidateRect(textEdit_, nullptr, TRUE);
+}
+
 bool SelectionOverlay::FinishText(bool commit) noexcept {
     if (!textEdit_) return true;
     if (commit) {
@@ -483,6 +556,7 @@ bool SelectionOverlay::FinishText(bool commit) noexcept {
         const int length = GetWindowTextW(textEdit_, text, static_cast<int>(std::size(text)));
         if (length) {
             Annotation mark = MakeMark(draft_.first);
+            mark.textSize = draft_.textSize;
             try {
                 mark.text.assign(text, static_cast<std::size_t>(length));
             } catch (...) {
@@ -499,6 +573,7 @@ bool SelectionOverlay::FinishText(bool commit) noexcept {
     textFont_.reset();
     draft_ = {};
     composingText_ = false;
+    paletteOpen_ = false;
     status_ = nullptr;
     SetFocus(window_);
     LayoutPanel();
@@ -530,14 +605,8 @@ RECT SelectionOverlay::ToClient(RECT rect) const noexcept {
     return rect;
 }
 
-void SelectionOverlay::HidePanel() noexcept {
-    if (!IsRectEmpty(&panel_)) InvalidateRect(window_, &panel_, FALSE);
-    panel_ = {};
-    for (const auto button : buttons_) ShowWindow(button, SW_HIDE);
-}
-
 void SelectionOverlay::LayoutPanel() noexcept {
-    if (closing_ || busy_ || !window_) return;
+    if (closing_ || busy_ || drag_ != Drag::None || !window_) return;
     const bool selected = !IsRectEmpty(&selection_);
     const HMONITOR monitor = selected ? MonitorFromRect(&selection_, MONITOR_DEFAULTTONEAREST)
                                       : MonitorFromPoint(anchor_, MONITOR_DEFAULTTONEAREST);
@@ -548,84 +617,14 @@ void SelectionOverlay::LayoutPanel() noexcept {
     UINT dpiX = 0, dpiY = 0;
     // 这里只查询按钮和字号的比例；选区和图像本身始终保持物理像素。
     if (FAILED(GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY)) || !dpiX) dpiX = GetDpiForWindow(window_);
-    if (!dpiX) dpiX = USER_DEFAULT_SCREEN_DPI;
-    if (dpi_ != dpiX || !font_) {
-        dpi_ = dpiX;
-        font_.reset(CreateUiFont(dpi_));
-    }
-
-    std::array<RECT, BCount> boxes{};
-    const LONG pad = Dip(8, dpi_);
-    const LONG gap = Dip(4, dpi_);
-    const LONG buttonHeight = Dip(28, dpi_);
-    const LONG header = Dip(23, dpi_);
-    const LONG maxWidth = std::max(1L, work.right - work.left - pad * 4);
-    LONG x = 0;
-    LONG y = header;
-    LONG width = std::min(maxWidth, static_cast<LONG>(Dip(selected ? 306 : 350, dpi_)));
-    const auto nextRow = [&] { x = 0; y += buttonHeight + gap; };
-    const auto add = [&](Button button) {
-        const LONG w = std::min(maxWidth, static_cast<LONG>(Dip(kButtons[button].width, dpi_)));
-        if (x && x + w > maxWidth) nextRow();
-        boxes[button] = {x, y, x + w, y + buttonHeight};
-        width = std::max(width, x + w);
-        x += w + gap;
-    };
-    if (selected) {
-        for (std::size_t i = BSelect; i <= BSize; ++i) add(static_cast<Button>(i));
-        nextRow();
-        add(BReselect);
-        add(BFullscreen);
-        add(BUndo);
-        add(BCopy);
-        add(BSave);
-        add(BPin);
-    } else {
-        add(BFullscreen);
-    }
-    add(BCancel);
-
-    const LONG panelWidth = width + 2 * pad;
-    const LONG panelHeight = y + buttonHeight + 2 * pad;
-    const LONG minX = work.left + pad;
-    const LONG minY = work.top + pad;
-    const LONG maxX = std::max(minX, work.right - pad - panelWidth);
-    const LONG maxY = std::max(minY, work.bottom - pad - panelHeight);
-    LONG left = work.left + (work.right - work.left - panelWidth) / 2;
-    LONG top = minY;
-    if (selected) {
-        left = selection_.right - panelWidth;
-        top = selection_.bottom + pad;
-        if (top > maxY) {
-            const LONG above = selection_.top - panelHeight - pad;
-            top = above >= minY ? above : selection_.bottom - panelHeight - pad;
-        }
-    }
-    left = std::clamp(left, minX, maxX);
-    top = std::clamp(top, minY, maxY);
-    const RECT old = panel_;
-    panel_ = ToClient({left, top, left + panelWidth, top + panelHeight});
-    wchar_t size[32]{};
-    std::swprintf(size, std::size(size), tool_ == EditTool::Text ? L"字号 %d" : L"线宽 %d",
-                  tool_ == EditTool::Text ? kTextSizes[textSize_] : kWidths[strokeSize_]);
-    SetWindowTextW(buttons_[BSize], size);
-    EnableWindow(buttons_[BUndo], !history_.empty());
-    for (std::size_t i = 0; i < buttons_.size(); ++i) {
-        const auto& box = boxes[i];
-        if (IsRectEmpty(&box)) ShowWindow(buttons_[i], SW_HIDE);
-        else {
-            SetWindowPos(buttons_[i], nullptr, panel_.left + pad + box.left, panel_.top + pad + box.top,
-                         box.right - box.left, box.bottom - box.top, SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
-            InvalidateRect(buttons_[i], nullptr, FALSE);
-        }
-    }
-    if (!IsRectEmpty(&old)) InvalidateRect(window_, &old, FALSE);
-    InvalidateRect(window_, &panel_, FALSE);
+    dpi_ = dpiX ? dpiX : USER_DEFAULT_SCREEN_DPI;
+    const ToolbarView view{tool_, style_, !history_.empty(), history_.can_redo() && !textEdit_, paletteOpen_};
+    toolbar_.Layout(ToClient(work), ToClient(selection_), dpi_, view, status_);
 }
 
 void SelectionOverlay::Status(const wchar_t* text) noexcept {
     status_ = text;
-    if (!IsRectEmpty(&panel_)) InvalidateRect(window_, &panel_, FALSE);
+    LayoutPanel();
 }
 
 void SelectionOverlay::RepaintSelection(const RECT& previous) noexcept {
@@ -672,63 +671,12 @@ void SelectionOverlay::Paint() noexcept {
             for (const auto point : handles) {
                 const RECT grip{point.x - radius, point.y - radius, point.x + radius + 1, point.y + radius + 1};
                 Fill(dc, grip, kAccent);
-                Border(dc, grip, kPanel);
+                Border(dc, grip, kGripBorder);
             }
         }
     }
-    if (!IsRectEmpty(&panel_)) {
-        Fill(dc, panel_, kPanel);
-        Border(dc, panel_, kPanelBorder);
-        RECT header = panel_;
-        InflateRect(&header, -Dip(8, dpi_), -Dip(5, dpi_));
-        header.bottom = header.top + Dip(23, dpi_);
-        SetBkMode(dc, TRANSPARENT);
-        SetTextColor(dc, kText);
-        const auto old = font_ ? SelectObject(dc, font_.get()) : nullptr;
-        wchar_t label[192]{};
-        if (hasSelection) {
-            std::swprintf(label, std::size(label), L"%ld × %ld 像素%ls%ls", selected.right - selected.left,
-                          selected.bottom - selected.top, status_ ? L"   ·   " : L"", status_ ? status_ : L"");
-        } else if (status_) {
-            lstrcpynW(label, status_, static_cast<int>(std::size(label)));
-        } else {
-            wchar_t binding[96]{};
-            FormatHotkey(shortcuts_[ShortcutIndex(Shortcut::Fullscreen)], binding);
-            std::swprintf(label, std::size(label), L"拖拽选择区域   ·   全屏：%ls", binding);
-        }
-        DrawTextW(dc, label, -1, &header, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
-        if (old) SelectObject(dc, old);
-    }
+    toolbar_.Paint(dc);
     EndPaint(window_, &paint);
-}
-
-void SelectionOverlay::PaintButton(const DRAWITEMSTRUCT& item) const noexcept {
-    const auto button = static_cast<Button>(item.CtlID - kButtonBase);
-    const bool color = button >= BRed && button <= BBlack;
-    const bool active = (button <= BMosaic && static_cast<EditTool>(button) == tool_) ||
-                        (color && button - BRed == color_);
-    const bool pressed = (item.itemState & ODS_SELECTED) != 0;
-    const bool disabled = (item.itemState & ODS_DISABLED) != 0;
-    auto rect = item.rcItem;
-    Fill(item.hDC, rect, pressed ? RGB(52, 73, 87) : active ? RGB(26, 65, 67) : RGB(33, 45, 61));
-    Border(item.hDC, rect, active || button == BCopy ? kAccent : kPanelBorder);
-    if (color) {
-        InflateRect(&rect, -Dip(4, dpi_), -Dip(6, dpi_));
-        Fill(item.hDC, rect, kColors[button - BRed]);
-    } else {
-        wchar_t label[36]{};
-        GetWindowTextW(item.hwndItem, label, static_cast<int>(std::size(label)));
-        const auto old = font_ ? SelectObject(item.hDC, font_.get()) : nullptr;
-        SetBkMode(item.hDC, TRANSPARENT);
-        SetTextColor(item.hDC, disabled ? RGB(140, 153, 171) : kText);
-        DrawTextW(item.hDC, label, -1, &rect, DT_SINGLELINE | DT_CENTER | DT_VCENTER | DT_NOPREFIX);
-        if (old) SelectObject(item.hDC, old);
-    }
-    if (item.itemState & ODS_FOCUS) {
-        rect = item.rcItem;
-        InflateRect(&rect, -2, -2);
-        DrawFocusRect(item.hDC, &rect);
-    }
 }
 
 }  // namespace picolet

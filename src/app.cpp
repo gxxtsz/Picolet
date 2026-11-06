@@ -9,6 +9,7 @@
 #include <commctrl.h>
 #include <dwmapi.h>
 #include <objbase.h>
+#include <gdiplus.h>
 #include <shellapi.h>
 #include <windowsx.h>
 
@@ -330,14 +331,22 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         ShowError(nullptr, L"无法初始化截图工具所需的系统组件。");
         return 1;
     }
-    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES};
-    InitCommonControlsEx(&controls);
+    const Gdiplus::GdiplusStartupInput graphicsInput;
+    ULONG_PTR graphicsToken = 0;
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_STANDARD_CLASSES | ICC_BAR_CLASSES};
+    if (!InitCommonControlsEx(&controls) ||
+        Gdiplus::GdiplusStartup(&graphicsToken, &graphicsInput, nullptr) != Gdiplus::Ok) {
+        ShowError(nullptr, L"无法初始化截图工具栏所需的系统组件。");
+        CoUninitialize();
+        return 1;
+    }
     int result = 1;
     {
         App app(instance);
         if (app.Initialize()) result = app.Run();
         else ShowError(nullptr, L"无法创建系统托盘入口。请确认 Windows 任务栏已启动。");
     }
+    Gdiplus::GdiplusShutdown(graphicsToken);
     CoUninitialize();
     return result;
 }
