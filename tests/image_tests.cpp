@@ -127,6 +127,59 @@ void TestAnnotations() {
           std::ranges::equal(composed.pixels(), frame.image.pixels()), "撤销所有标注没有恢复原图");
 }
 
+void TestMosaicDraft() {
+    DesktopFrame frame;
+    frame.bounds = {-20, -14, 8, 10};
+    Check(SUCCEEDED(frame.image.Resize(28, 24)), "创建马赛克预览测试帧失败");
+    for (std::size_t i = 0; i < frame.image.pixels().size(); ++i) {
+        frame.image.pixels()[i] = i % 2 ? 0xff00ff00u : 0xff0000ffu;
+    }
+
+    // 用红色标注区分底图和合成图，同时准备一笔可重做的标注。
+    AnnotationHistory history;
+    Annotation box;
+    box.tool = EditTool::Rectangle;
+    box.clip = frame.bounds;
+    box.filled = true;
+    box.color = RGB(255, 0, 0);
+    box.first = {-16, -10};
+    box.last = {-10, -4};
+    Check(history.Commit(frame, Annotation(box)) == S_OK, "创建预览下方的标注失败");
+    box.first = {1, 5};
+    box.last = {3, 7};
+    Check(history.Commit(frame, std::move(box)) == S_OK && history.Undo(frame) == S_OK && history.can_redo(),
+          "创建预览时的重做分支失败");
+    Image before;
+    Check(history.Render(frame, frame.bounds, before) == S_OK, "读取预览前的图像失败");
+
+    Annotation mosaic;
+    mosaic.tool = EditTool::Mosaic;
+    mosaic.clip = {-24, -18, 7, 9};
+    mosaic.first = {-1, 4};
+    mosaic.last = {-22, -16};
+    const RECT area = SelectionRect(mosaic.first, mosaic.last, mosaic.clip);
+    Image preview;
+    Check(history.RenderMosaicDraft(frame, area, preview) == S_OK && preview.width() == 20 && preview.height() == 19,
+          "反向拖动的马赛克预览未按冻结帧边界裁剪");
+    Check((preview.pixels()[0] & 0x00ff0000u) != 0, "马赛克预览没有使用已提交的标注像素");
+
+    const RECT smaller = SelectionRect(mosaic.first, {-8, -3}, mosaic.clip);
+    Image shrunk;
+    Check(history.RenderMosaicDraft(frame, smaller, shrunk) == S_OK && shrunk.width() == 8 && shrunk.height() == 8 &&
+          std::ranges::all_of(shrunk.pixels(), [](auto pixel) { return pixel == 0xff007f7fu; }),
+          "缩小草稿时没有按新的边界重新取样");
+    Check(history.RenderMosaicDraft(frame, {}, shrunk) == S_FALSE && shrunk.width() == 8,
+          "空草稿不应覆盖上次生成的图像");
+
+    Image after;
+    Check(history.Render(frame, frame.bounds, after) == S_OK && std::ranges::equal(before.pixels(), after.pixels()),
+          "移动马赛克草稿改变了已提交的图像");
+    Check(history.Redo(frame) == S_OK && history.Undo(frame) == S_OK, "马赛克草稿改变了撤销或重做记录");
+    Check(history.Commit(frame, std::move(mosaic)) == S_OK && !history.can_redo() &&
+          history.Render(frame, area, after) == S_OK && std::ranges::equal(preview.pixels(), after.pixels()),
+          "马赛克预览与提交后的边缘块像素不一致");
+}
+
 void TestShapeAnnotations() {
     DesktopFrame frame;
     frame.bounds = {-16, -14, 16, 16};
@@ -306,6 +359,7 @@ int main() {
         TestCrop();
         TestSelectionAdjustments();
         TestAnnotations();
+        TestMosaicDraft();
         TestShapeAnnotations();
         TestShortcuts();
         TestPng();

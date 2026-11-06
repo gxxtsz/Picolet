@@ -16,7 +16,8 @@ public:
 
     static bool Register(HINSTANCE instance, HICON icon) noexcept;
 
-    // 把 image 移入新的置顶窗口，初始位置靠近选区；图片超过显示器工作区时等比缩小。
+    // 把 image 移入新的置顶窗口，初始位置靠近选区，优先让图片与原选区对齐。
+    // 窗口四边各预留两像素绘制深浅边线。空间不足时只等比缩小显示区域，保留原图像素。
     // 返回失败时不留下窗口。调用方如需重试，可从截图会话重新生成合成图。
     HRESULT Open(HINSTANCE instance, HWND owner, Image&& image, const RECT& selection) noexcept;
 

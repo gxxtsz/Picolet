@@ -5,12 +5,16 @@
 #include <windowsx.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 
 namespace picolet {
 namespace {
 
 constexpr wchar_t kPinClass[] = L"Picolet.Pin";
+constexpr std::array<COLORREF, 2> kFrameColors{RGB(38, 38, 38), RGB(245, 245, 245)};
+// FrameRect 每道边占一个物理像素。窗口比实际图片四周各多出这段距离。
+constexpr LONG kFrameInset = static_cast<LONG>(kFrameColors.size());
 
 RECT WorkArea(HMONITOR monitor) noexcept {
     MONITORINFO info{};
@@ -59,13 +63,15 @@ struct PinWindows::Pin {
         return self ? self->Handle(message, wparam, lparam) : DefWindowProcW(hwnd, message, wparam, lparam);
     }
 
-    void Place(RECT rect, HMONITOR monitor) const noexcept {
+    // rect 是含边框的窗口范围，按指定屏幕限制位置以保留可抓取区域。
+    bool Place(RECT rect, HMONITOR monitor) const noexcept {
         const auto dpi = GetDpiForWindow(window);
         rect = KeepReachable(rect, WorkArea(monitor), dpi ? dpi : USER_DEFAULT_SCREEN_DPI);
-        SetWindowPos(window, HWND_TOPMOST, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
-                     SWP_NOACTIVATE);
+        return SetWindowPos(window, HWND_TOPMOST, rect.left, rect.top, rect.right - rect.left,
+                            rect.bottom - rect.top, SWP_NOACTIVATE) != FALSE;
     }
 
+    // 按滚轮倍率调整内框中的图片。光标落在边框上时，固定离光标最近的图片边缘。
     void Zoom(int wheel) noexcept {
         if (dragging || !wheel) return;
         RECT previous{};
@@ -81,13 +87,19 @@ struct PinWindows::Pin {
         if (scale == next) return;
         const LONG width = std::max(1L, std::lround(image.width() * next));
         const LONG height = std::max(1L, std::lround(image.height() * next));
-        const LONG x = cursor.x - std::lround(static_cast<double>(cursor.x - previous.left) * width /
+        InflateRect(&previous, -kFrameInset, -kFrameInset);
+        const POINT anchor{std::clamp(cursor.x, previous.left, previous.right),
+                           std::clamp(cursor.y, previous.top, previous.bottom)};
+        const LONG x = anchor.x - std::lround(static_cast<double>(anchor.x - previous.left) * width /
                                              (previous.right - previous.left));
-        const LONG y = cursor.y - std::lround(static_cast<double>(cursor.y - previous.top) * height /
+        const LONG y = anchor.y - std::lround(static_cast<double>(anchor.y - previous.top) * height /
                                              (previous.bottom - previous.top));
-        scale = next;
-        Place({x, y, x + width, y + height}, monitor);
-        InvalidateRect(window, nullptr, FALSE);
+        RECT outer{x, y, x + width, y + height};
+        InflateRect(&outer, kFrameInset, kFrameInset);
+        if (Place(outer, monitor)) {
+            scale = next;
+            InvalidateRect(window, nullptr, FALSE);
+        }
     }
 
     LRESULT Handle(UINT message, WPARAM wparam, LPARAM lparam) noexcept {
@@ -100,6 +112,12 @@ struct PinWindows::Pin {
             if (dc) {
                 RECT client{};
                 GetClientRect(window, &client);
+                const auto brush = static_cast<HBRUSH>(GetStockObject(DC_BRUSH));
+                for (const COLORREF color : kFrameColors) {
+                    SetDCBrushColor(dc, color);
+                    FrameRect(dc, &client, brush);
+                    InflateRect(&client, -1, -1);
+                }
                 SetStretchBltMode(dc, HALFTONE);
                 SetBrushOrgEx(dc, 0, 0, nullptr);
                 DrawImage(dc, image, client);
@@ -175,7 +193,9 @@ HRESULT PinWindows::Open(HINSTANCE instance, HWND owner, Image&& image, const RE
     }
     auto& pin = *pins_.back();
     const RECT work = WorkArea(MonitorFromRect(&selection, MONITOR_DEFAULTTONEAREST));
-    const RECT fitted = FitImage(image, work);
+    RECT available = work;
+    InflateRect(&available, -kFrameInset, -kFrameInset);
+    const RECT fitted = FitImage(image, available);
     const LONG width = fitted.right - fitted.left;
     const LONG height = fitted.bottom - fitted.top;
     if (width <= 0 || height <= 0) {
@@ -185,10 +205,12 @@ HRESULT PinWindows::Open(HINSTANCE instance, HWND owner, Image&& image, const RE
     pin.scale = std::min(static_cast<double>(width) / image.width(), static_cast<double>(height) / image.height());
     pin.minScale = std::min(0.1, pin.scale);
     pin.image = std::move(image);
-    const LONG x = std::clamp(selection.left, work.left, work.right - width);
-    const LONG y = std::clamp(selection.top, work.top, work.bottom - height);
+    const LONG outerWidth = width + 2 * kFrameInset;
+    const LONG outerHeight = height + 2 * kFrameInset;
+    const LONG x = std::clamp(selection.left - kFrameInset, work.left, work.right - outerWidth);
+    const LONG y = std::clamp(selection.top - kFrameInset, work.top, work.bottom - outerHeight);
     const HWND window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, kPinClass, L"Picolet 贴图",
-                                        WS_POPUP, x, y, width, height, owner, nullptr, instance, &pin);
+                                        WS_POPUP, x, y, outerWidth, outerHeight, owner, nullptr, instance, &pin);
     if (!window || !SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0,
                                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
         const auto error = LastErrorResult();

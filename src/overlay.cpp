@@ -5,6 +5,7 @@
 #include <windowsx.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdlib>
 
 namespace picolet {
@@ -26,6 +27,36 @@ void Border(HDC dc, const RECT& rect, COLORREF color) noexcept {
 }
 
 bool SamePoint(POINT a, POINT b) noexcept { return a.x == b.x && a.y == b.y; }
+
+// 生成 32×32 原生光标，中心为点击热点。掩码从每行的高位开始，留空处显示底图，
+// 十字中心线显示白色，外扩一像素显示黑色。返回句柄由遮罩对象持有并在进程退出时释放。
+HCURSOR CreateCaptureCursor(HINSTANCE instance) noexcept {
+    constexpr int size = 32;
+    constexpr int center = size / 2;
+    constexpr int arm = 8;
+    std::array<BYTE, size * size / 8> andMask{};
+    std::array<BYTE, size * size / 8> xorMask{};
+    andMask.fill(0xff);
+    for (int y = center - arm - 1; y <= center + arm + 1; ++y) {
+        for (int x = center - arm - 1; x <= center + arm + 1; ++x) {
+            const int dx = std::abs(x - center);
+            const int dy = std::abs(y - center);
+            if (dx > 1 && dy > 1) continue;
+            const auto index = static_cast<std::size_t>(y * (size / 8) + x / 8);
+            const auto bit = static_cast<BYTE>(0x80 >> (x % 8));
+            andMask[index] &= static_cast<BYTE>(~bit);
+            if ((dx == 0 && dy <= arm) || (dy == 0 && dx <= arm)) xorMask[index] |= bit;
+        }
+    }
+    return CreateCursor(instance, center, center, size, size, andMask.data(), xorMask.data());
+}
+
+// 读取指定显示器的界面 DPI。遮罩跨屏时，窗口 DPI 只用作查询失败的回退值。
+UINT ScreenDpi(HMONITOR monitor, HWND window) noexcept {
+    UINT x = 0, y = 0;
+    if (FAILED(GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &x, &y)) || !x) x = GetDpiForWindow(window);
+    return x ? x : USER_DEFAULT_SCREEN_DPI;
+}
 
 }  // namespace
 
@@ -58,6 +89,7 @@ HRESULT SelectionOverlay::Open(HINSTANCE instance, HWND owner, const DesktopFram
     drag_ = Drag::None;
     status_ = nullptr;
     activated_ = invalidated_ = pending_ = busy_ = closing_ = composingText_ = paletteOpen_ = false;
+    if (!crosshair_) crosshair_.reset(CreateCaptureCursor(instance));
 
     const auto& bounds = frame.bounds;
     const HWND window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, kOverlayClass, L"Picolet 截图",
@@ -76,6 +108,7 @@ HRESULT SelectionOverlay::Open(HINSTANCE instance, HWND owner, const DesktopFram
     }
     SetForegroundWindow(window_);
     UpdateWindow(window_);
+    RefreshCursor();
     return S_OK;
 }
 
@@ -213,25 +246,12 @@ LRESULT SelectionOverlay::Handle(UINT message, WPARAM wparam, LPARAM lparam) noe
             SetCursor(LoadCursorW(nullptr, IDC_ARROW));
             return TRUE;
         }
-        if (reinterpret_cast<HWND>(wparam) == window_) {
+        if (reinterpret_cast<HWND>(wparam) == window_ && frame_) {
             POINT cursor{};
-            GetCursorPos(&cursor);
-            LPCWSTR shape = IDC_CROSS;
-            const POINT client{cursor.x - frame_->bounds.left, cursor.y - frame_->bounds.top};
-            if (toolbar_.Contains(client)) {
-                shape = IDC_ARROW;
-            } else if (tool_ == EditTool::Select && !IsRectEmpty(&selection_)) {
-                const unsigned edges = drag_ == Drag::Resize ? edges_ : HitEdges(cursor);
-                if (edges == (EdgeLeft | EdgeTop) || edges == (EdgeRight | EdgeBottom)) shape = IDC_SIZENWSE;
-                else if (edges == (EdgeLeft | EdgeBottom) || edges == (EdgeRight | EdgeTop)) shape = IDC_SIZENESW;
-                else if (edges & (EdgeLeft | EdgeRight)) shape = IDC_SIZEWE;
-                else if (edges & (EdgeTop | EdgeBottom)) shape = IDC_SIZENS;
-                else if (drag_ == Drag::Move || PtInRect(&selection_, cursor)) shape = IDC_SIZEALL;
-            } else if (tool_ == EditTool::Text && PtInRect(&selection_, cursor)) {
-                shape = IDC_IBEAM;
+            if (GetCursorPos(&cursor)) {
+                SetCanvasCursor(cursor);
+                return TRUE;
             }
-            SetCursor(LoadCursorW(nullptr, shape));
-            return TRUE;
         }
         break;
     case WM_COMMAND:
@@ -406,6 +426,31 @@ POINT SelectionOverlay::MessagePoint() const noexcept {
     return point;
 }
 
+void SelectionOverlay::SetCanvasCursor(POINT point) const noexcept {
+    LPCWSTR shape = IDC_CROSS;
+    const POINT client{point.x - frame_->bounds.left, point.y - frame_->bounds.top};
+    if (drag_ == Drag::None && (busy_ || toolbar_.Contains(client))) {
+        shape = IDC_ARROW;
+    } else if (drag_ == Drag::Move) {
+        shape = IDC_SIZEALL;
+    } else if (drag_ == Drag::Resize || (drag_ == Drag::None && tool_ == EditTool::Select)) {
+        const unsigned edges = drag_ == Drag::Resize ? edges_ : HitEdges(point);
+        if (edges == (EdgeLeft | EdgeTop) || edges == (EdgeRight | EdgeBottom)) shape = IDC_SIZENWSE;
+        else if (edges == (EdgeLeft | EdgeBottom) || edges == (EdgeRight | EdgeTop)) shape = IDC_SIZENESW;
+        else if (edges & (EdgeLeft | EdgeRight)) shape = IDC_SIZEWE;
+        else if (edges & (EdgeTop | EdgeBottom)) shape = IDC_SIZENS;
+        else if (PtInRect(&selection_, point)) shape = IDC_SIZEALL;
+    } else if (tool_ == EditTool::Text && PtInRect(&selection_, point)) {
+        shape = IDC_IBEAM;
+    }
+    SetCursor(shape == IDC_CROSS && crosshair_ ? crosshair_.get() : LoadCursorW(nullptr, shape));
+}
+
+void SelectionOverlay::RefreshCursor() const noexcept {
+    POINT point{};
+    if (window_ && GetCursorPos(&point) && WindowFromPoint(point) == window_) SetCanvasCursor(point);
+}
+
 unsigned SelectionOverlay::HitEdges(POINT point) const noexcept {
     if (IsRectEmpty(&selection_)) return EdgeNone;
     const LONG grip = Dip(6, dpi_);
@@ -456,7 +501,15 @@ void SelectionOverlay::BeginDrag(POINT point) noexcept {
         SetFocus(window_);
         toolbar_.Hide();
         SetCapture(window_);
-        if (GetCapture() != window_) AbortDrag();
+        if (GetCapture() != window_) {
+            AbortDrag();
+            return;
+        }
+        SetCanvasCursor(point);
+        if (drag_ != Drag::Mark && !IsRectEmpty(&selection_)) {
+            toolbar_.LayoutDimension(DimensionScreen(), ToClient(selection_));
+            RepaintSelection(selection_);
+        }
     }
 }
 
@@ -471,6 +524,12 @@ void SelectionOverlay::UpdateDrag(POINT point) noexcept {
         point.x = std::clamp(point.x, selection_.left, selection_.right - 1);
         point.y = std::clamp(point.y, selection_.top, selection_.bottom - 1);
         if (SamePoint(point, draft_.last)) return;
+        if (draft_.tool == EditTool::Mosaic) {
+            InvalidateMosaicDraft();
+            draft_.last = point;
+            InvalidateMosaicDraft();
+            return;
+        }
         if (draft_.tool == EditTool::Pen) {
             try {
                 if (draft_.path.empty()) draft_.path.push_back(draft_.first);
@@ -482,10 +541,14 @@ void SelectionOverlay::UpdateDrag(POINT point) noexcept {
             }
         }
         draft_.last = point;
-        break;
+        RepaintSelection(previous);
+        return;
     default: return;
     }
-    RepaintSelection(previous);
+    if (!EqualRect(&selection_, &previous)) {
+        toolbar_.LayoutDimension(DimensionScreen(), ToClient(selection_));
+        RepaintSelection(previous);
+    }
 }
 
 void SelectionOverlay::EndDrag(POINT point) noexcept {
@@ -498,6 +561,7 @@ void SelectionOverlay::EndDrag(POINT point) noexcept {
     draft_ = {};
     LayoutPanel();
     RepaintSelection(selection_);
+    RefreshCursor();
 }
 
 void SelectionOverlay::AbortDrag() noexcept {
@@ -508,6 +572,7 @@ void SelectionOverlay::AbortDrag() noexcept {
     if (GetCapture() == window_) ReleaseCapture();
     LayoutPanel();
     RepaintSelection(previous);
+    RefreshCursor();
 }
 
 void SelectionOverlay::BeginText(POINT point) noexcept {
@@ -605,6 +670,17 @@ RECT SelectionOverlay::ToClient(RECT rect) const noexcept {
     return rect;
 }
 
+ToolbarArea SelectionOverlay::DimensionScreen() const noexcept {
+    const HMONITOR monitor = MonitorFromPoint({selection_.left, selection_.top}, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    RECT bounds{};
+    if (!GetMonitorInfoW(monitor, &info) || !IntersectRect(&bounds, &info.rcMonitor, &frame_->bounds)) {
+        bounds = frame_->bounds;
+    }
+    return {ToClient(bounds), ScreenDpi(monitor, window_)};
+}
+
 void SelectionOverlay::LayoutPanel() noexcept {
     if (closing_ || busy_ || drag_ != Drag::None || !window_) return;
     const bool selected = !IsRectEmpty(&selection_);
@@ -614,12 +690,10 @@ void SelectionOverlay::LayoutPanel() noexcept {
     info.cbSize = sizeof(info);
     RECT work{};
     if (!GetMonitorInfoW(monitor, &info) || !IntersectRect(&work, &info.rcWork, &frame_->bounds)) work = frame_->bounds;
-    UINT dpiX = 0, dpiY = 0;
-    // 这里只查询按钮和字号的比例；选区和图像本身始终保持物理像素。
-    if (FAILED(GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpiX, &dpiY)) || !dpiX) dpiX = GetDpiForWindow(window_);
-    dpi_ = dpiX ? dpiX : USER_DEFAULT_SCREEN_DPI;
+    dpi_ = ScreenDpi(monitor, window_);
     const ToolbarView view{tool_, style_, !history_.empty(), history_.can_redo() && !textEdit_, paletteOpen_};
-    toolbar_.Layout(ToClient(work), ToClient(selection_), dpi_, view, status_);
+    const ToolbarArea area{ToClient(work), dpi_};
+    toolbar_.Layout(area, selected ? DimensionScreen() : area, ToClient(selection_), view, status_);
 }
 
 void SelectionOverlay::Status(const wchar_t* text) noexcept {
@@ -634,6 +708,29 @@ void SelectionOverlay::RepaintSelection(const RECT& previous) noexcept {
         InflateRect(&changed, Dip(8, dpi_), Dip(8, dpi_));
         InvalidateRect(window_, &changed, FALSE);
     }
+}
+
+RECT SelectionOverlay::MosaicDraftArea() const noexcept {
+    return SelectionRect(draft_.first, draft_.last, draft_.clip);
+}
+
+void SelectionOverlay::InvalidateMosaicDraft() const noexcept {
+    const RECT area = ToClient(MosaicDraftArea());
+    if (!IsRectEmpty(&area)) InvalidateRect(window_, &area, FALSE);
+}
+
+void SelectionOverlay::PaintDraft(HDC dc) const noexcept {
+    if (draft_.tool == EditTool::Mosaic) {
+        const RECT area = MosaicDraftArea();
+        const RECT client = ToClient(area);
+        if (IsRectEmpty(&client) || !RectVisible(dc, &client)) return;
+        Image preview;
+        if (history_.RenderMosaicDraft(*frame_, area, preview) == S_OK) {
+            DrawImage(dc, preview, client);
+            return;
+        }
+    }
+    DrawAnnotationDraft(dc, draft_, {frame_->bounds.left, frame_->bounds.top});
 }
 
 void SelectionOverlay::Paint() noexcept {
@@ -657,7 +754,7 @@ void SelectionOverlay::Paint() noexcept {
             DrawImage(dc, frame_->image, canvas);
             const auto& patch = history_.patch();
             DrawImage(dc, patch.image, ToClient(patch.bounds));
-            if (drag_ == Drag::Mark) DrawAnnotationDraft(dc, draft_, {frame_->bounds.left, frame_->bounds.top});
+            if (drag_ == Drag::Mark) PaintDraft(dc);
             RestoreDC(dc, saved);
         }
         Border(dc, selected, kAccent);

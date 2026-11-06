@@ -99,6 +99,7 @@ bool DrawMark(HDC dc, const Annotation& mark, POINT origin) noexcept {
             ? CreatePen(PS_DOT, 1, RGB(245, 245, 245))
             : ExtCreatePen(PS_GEOMETRIC | PS_SOLID | PS_ENDCAP_ROUND | PS_JOIN_ROUND, mark.width, &style, 0, nullptr));
         if (pen && SelectObject(dc, pen.get()) && SelectObject(dc, GetStockObject(NULL_BRUSH))) {
+            if (mark.tool == EditTool::Mosaic) SetBkMode(dc, TRANSPARENT);
             const RECT rect = DragBounds(mark.first, mark.last);
             switch (mark.tool) {
             case EditTool::Rectangle:
@@ -332,6 +333,15 @@ HRESULT AnnotationHistory::Render(const DesktopFrame& frame, const RECT& selecti
         }
     }
     result = std::move(image);
+    return S_OK;
+}
+
+HRESULT AnnotationHistory::RenderMosaicDraft(const DesktopFrame& frame, const RECT& area, Image& result) const noexcept {
+    RECT crop{};
+    if (!IntersectRect(&crop, &area, &frame.bounds)) return S_FALSE;
+    const auto status = Render(frame, crop, result);
+    if (FAILED(status)) return status;
+    Mosaic(result.pixels().data(), crop, crop);
     return S_OK;
 }
 

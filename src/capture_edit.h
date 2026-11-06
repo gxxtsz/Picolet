@@ -38,7 +38,7 @@ struct Annotation {
 };
 
 // 在已有像素之上绘制尚未提交的标注；origin 为设备上下文 (0, 0) 对应的桌面坐标。
-// 马赛克草稿只显示边界，松手提交后才修改实际像素。
+// 马赛克通常使用像素预览，无法生成预览时可用本函数画出虚线边界。
 void DrawAnnotationDraft(HDC dc, const Annotation& mark, POINT origin) noexcept;
 
 // 保存当前会话的标注顺序和合成像素。冻结帧始终由调用方持有；所有方法在同一 UI 线程调用。
@@ -62,6 +62,11 @@ public:
 
     // 从冻结帧及同一块合成像素提取原尺寸图片。成功才替换 result，不含任何界面元素。
     HRESULT Render(const DesktopFrame& frame, const RECT& selection, Image& result) const noexcept;
+
+    // 从已合成画面裁出物理坐标 area，按提交时的分块规则生成马赛克草稿。
+    // area 由调用方限制在笔画的选区内，本方法再裁到冻结帧边缘。
+    // 只有返回 S_OK 时才替换 result。无交集时返回 S_FALSE，调用不会修改标注历史。
+    HRESULT RenderMosaicDraft(const DesktopFrame& frame, const RECT& area, Image& result) const noexcept;
 
 private:
     // 按前 count 笔合成。追加新标注时，把候选笔画叠在此前缀上，重做分支留待提交后清理。

@@ -11,7 +11,7 @@ inline constexpr UINT kOverlayAction = WM_APP + 2;
 enum class OverlayAction : WPARAM { Cancel, Copy, Save, Pin };
 
 // 置顶遮罩和选区工具栏。调用方保有冻结帧，在关闭遮罩之前不能修改或释放它。
-// 选区和标注使用桌面物理坐标；窗口布局单独按工具栏所在屏幕的 DPI 缩放。
+// 选区和标注使用桌面物理坐标，工具栏与尺寸标签各自按所在屏幕的 DPI 布局。
 class SelectionOverlay {
 public:
     static bool Register(HINSTANCE instance, HICON icon) noexcept;
@@ -61,11 +61,24 @@ private:
     bool FinishText(bool commit) noexcept;
     void UpdateTextStyle() noexcept;
 
+    // 根据画布命中位置或已捕获的拖动操作设置光标。point 使用桌面物理坐标。
+    void SetCanvasCursor(POINT point) const noexcept;
+    // 窗口显示或拖动结束时同步光标，仅在鼠标实际指向本画布时生效。
+    void RefreshCursor() const noexcept;
+
     RECT ToClient(RECT rect) const noexcept;
     POINT MessagePoint() const noexcept;
+    // 取得选区左上角所在显示器的客户区物理范围与 DPI，供尺寸标签单独布局。
+    ToolbarArea DimensionScreen() const noexcept;
     void LayoutPanel() noexcept;
     void Status(const wchar_t* text) noexcept;
     void RepaintSelection(const RECT& previous) noexcept;
+
+    // 马赛克草稿只影响原选区内的矩形。每次改变终点前后各标记一次，旧预览由底图重绘清除。
+    RECT MosaicDraftArea() const noexcept;
+    void InvalidateMosaicDraft() const noexcept;
+    // 在已裁到选区的 DC 上叠绘草稿，马赛克只在草稿区域需要重绘时计算像素。
+    void PaintDraft(HDC dc) const noexcept;
     void Paint() noexcept;
 
     HWND window_ = nullptr;
@@ -78,6 +91,7 @@ private:
     AnnotationHistory history_;
     Annotation draft_;
     FontHandle textFont_;
+    UniqueHandle<HCURSOR, DestroyCursor> crosshair_;
     UINT dpi_ = USER_DEFAULT_SCREEN_DPI;
     RECT selection_{};
     RECT original_{};

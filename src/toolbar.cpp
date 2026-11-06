@@ -333,6 +333,7 @@ void CaptureToolbar::Close() noexcept {
     for (auto& control : controls_) if (control) DestroyWindow(std::exchange(control, nullptr));
     hovered_ = parent_ = nullptr;
     font_.reset();
+    dimensionFont_.reset();
     main_ = options_ = palette_ = dimension_ = status_ = sizeLabel_ = valueLabel_ = {};
     separators_.fill({});
 }
@@ -352,14 +353,44 @@ void CaptureToolbar::Hide() noexcept {
     separators_.fill({});
 }
 
-void CaptureToolbar::Layout(const RECT& monitorWork, const RECT& selection, UINT dpi,
+bool CaptureToolbar::OverlapsBars(const RECT& rect) const noexcept {
+    RECT overlap{};
+    return IntersectRect(&overlap, &rect, &main_) || IntersectRect(&overlap, &rect, &options_) ||
+           IntersectRect(&overlap, &rect, &palette_);
+}
+
+void CaptureToolbar::LayoutDimension(const ToolbarArea& screen, const RECT& selection) noexcept {
+    if (!IsRectEmpty(&dimension_)) InvalidateRect(parent_, &dimension_, FALSE);
+    dimension_ = {};
+    if (IsRectEmpty(&selection) || IsRectEmpty(&screen.bounds)) return;
+    const UINT dpi = screen.dpi;
+    if (dimensionDpi_ != dpi || !dimensionFont_) {
+        dimensionDpi_ = dpi;
+        dimensionFont_.reset(CreateUiFont(dpi));
+    }
+    std::swprintf(dimensionText_, std::size(dimensionText_), L"%ld × %ld 像素",
+                  selection.right - selection.left, selection.bottom - selection.top);
+    const LONG width = TextWidth(parent_, dimensionFont_.get(), dimensionText_) + Dip(16, dpi);
+    const LONG height = Dip(24, dpi);
+    const LONG gap = Dip(6, dpi);
+    const LONG above = selection.top - gap - height;
+    dimension_ = Place(screen.bounds, selection.left, above, width, height);
+    if (above < screen.bounds.top || OverlapsBars(dimension_)) {
+        const LONG inset = std::min(gap, selection.bottom - selection.top - 1);
+        dimension_ = Place(screen.bounds, selection.left, selection.top + inset, width, height);
+    }
+    InvalidateRect(parent_, &dimension_, FALSE);
+}
+
+void CaptureToolbar::Layout(const ToolbarArea& workArea, const ToolbarArea& labelScreen, const RECT& selection,
                             const ToolbarView& view, const wchar_t* status) noexcept {
-    if (IsRectEmpty(&monitorWork)) {
+    if (IsRectEmpty(&workArea.bounds)) {
         Hide();
         return;
     }
     InvalidateSurfaces();
     SendMessageW(tooltip_, TTM_POP, 0, 0);
+    const UINT dpi = workArea.dpi;
     if (dpi_ != dpi || !font_) {
         dpi_ = dpi;
         font_.reset(CreateUiFont(dpi_));
@@ -369,7 +400,7 @@ void CaptureToolbar::Layout(const RECT& monitorWork, const RECT& selection, UINT
     separators_.fill({});
     lstrcpynW(statusText_, status ? status : L"", static_cast<int>(std::size(statusText_)));
 
-    RECT work = monitorWork;
+    RECT work = workArea.bounds;
     InflateRect(&work, -std::min<LONG>(Dip(8, dpi), (work.right - work.left - 1) / 2),
                 -std::min<LONG>(Dip(8, dpi), (work.bottom - work.top - 1) / 2));
     const LONG available = work.right - work.left;
@@ -469,32 +500,28 @@ void CaptureToolbar::Layout(const RECT& monitorWork, const RECT& selection, UINT
     Offset(sizeLabel_, options_.left + pad, options_.top + pad);
     Offset(valueLabel_, options_.left + pad, options_.top + pad);
 
-    if (selected) {
-        std::swprintf(dimensionText_, std::size(dimensionText_), L"%ld × %ld 像素",
-                      selection.right - selection.left, selection.bottom - selection.top);
-    } else {
-        lstrcpynW(dimensionText_, hintText_, static_cast<int>(std::size(dimensionText_)));
-    }
-    const auto placeTag = [&](const wchar_t* text, LONG left, LONG top) {
-        const LONG width = TextWidth(parent_, font_.get(), text) + Dip(16, dpi);
+    const auto placeTag = [&](LONG width, LONG left, LONG top) {
         RECT tag = Place(work, left, top, width, tagHeight);
-        RECT overlap{};
-        if (IntersectRect(&overlap, &tag, &main_) || IntersectRect(&overlap, &tag, &options_) ||
-            IntersectRect(&overlap, &tag, &palette_)) {
+        if (OverlapsBars(tag)) {
             tag = Place(work, left, selected ? selection.top + gap : main_.bottom + gap, width, tagHeight);
         }
         return tag;
     };
-    const LONG tagY = selected ? selection.top - gap - tagHeight : main_.top - gap - tagHeight;
-    const LONG tagX = selected ? selection.left :
-        (work.left + work.right - TextWidth(parent_, font_.get(), dimensionText_) - Dip(16, dpi)) / 2;
-    dimension_ = placeTag(dimensionText_, tagX, tagY);
+    if (selected) {
+        LayoutDimension(labelScreen, selection);
+    } else {
+        dimensionFont_.reset();
+        dimensionDpi_ = dpi;
+        lstrcpynW(dimensionText_, hintText_, static_cast<int>(std::size(dimensionText_)));
+        const LONG width = TextWidth(parent_, font_.get(), dimensionText_) + Dip(16, dpi);
+        dimension_ = placeTag(width, (work.left + work.right - width) / 2, main_.top - gap - tagHeight);
+    }
     if (*statusText_) {
         const LONG width = TextWidth(parent_, font_.get(), statusText_) + Dip(16, dpi);
         if (dimension_.right + gap + width <= work.right)
-            status_ = placeTag(statusText_, dimension_.right + gap, dimension_.top);
+            status_ = placeTag(width, dimension_.right + gap, dimension_.top);
         else
-            status_ = placeTag(statusText_, dimension_.left, dimension_.bottom + gap);
+            status_ = placeTag(width, dimension_.left, dimension_.bottom + gap);
     }
 
     EnableWindow(controls_[Index(Button::Undo)], view.canUndo);
@@ -578,15 +605,16 @@ LRESULT CALLBACK CaptureToolbar::ButtonProc(HWND window, UINT message, WPARAM wp
 }
 
 void CaptureToolbar::Paint(HDC dc) const noexcept {
-    if (IsRectEmpty(&main_)) return;
+    if (IsRectEmpty(&main_) && IsRectEmpty(&dimension_)) return;
     {
         Graphics graphics(dc);
         Smooth(graphics);
-        for (const auto& rect : {main_, options_, palette_, dimension_, status_}) {
-            if (IsRectEmpty(&rect)) continue;
-            auto box = Box(rect);
+        for (const auto* rect : {&main_, &options_, &palette_, &status_, &dimension_}) {
+            if (IsRectEmpty(rect)) continue;
+            auto box = Box(*rect);
             box.Inflate(-0.5f, -0.5f);
-            Rounded(graphics, box, static_cast<float>(Dip(10, dpi_)), kWhite, &kBorder);
+            const UINT dpi = rect == &dimension_ ? dimensionDpi_ : dpi_;
+            Rounded(graphics, box, static_cast<float>(Dip(10, dpi)), kWhite, &kBorder);
         }
         const SolidBrush divider(Opaque(kBorder));
         for (const auto& rect : separators_) {
@@ -595,12 +623,16 @@ void CaptureToolbar::Paint(HDC dc) const noexcept {
     }
     const auto previous = font_ ? SelectObject(dc, font_.get()) : nullptr;
     const int oldMode = SetBkMode(dc, TRANSPARENT);
-    const auto textInset = [&](RECT rect) {
-        InflateRect(&rect, -Dip(8, dpi_), 0);
-        return rect;
-    };
-    Caption(dc, textInset(dimension_), dimensionText_, kInk, DT_CENTER);
-    Caption(dc, textInset(status_), statusText_, kInk, DT_LEFT);
+    if (!IsRectEmpty(&dimension_)) {
+        const auto previousLabel = dimensionFont_ ? SelectObject(dc, dimensionFont_.get()) : nullptr;
+        RECT text = dimension_;
+        InflateRect(&text, -Dip(8, dimensionDpi_), 0);
+        Caption(dc, text, dimensionText_, kInk, DT_CENTER);
+        if (previousLabel) SelectObject(dc, previousLabel);
+    }
+    RECT statusText = status_;
+    InflateRect(&statusText, -Dip(8, dpi_), 0);
+    Caption(dc, statusText, statusText_, kInk, DT_LEFT);
     Caption(dc, sizeLabel_, view_.tool == EditTool::Text ? L"字号" : L"粗细", kMuted, DT_CENTER);
     wchar_t number[12]{};
     std::swprintf(number, std::size(number), L"%d", value_);

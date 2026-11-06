@@ -44,6 +44,12 @@ struct ToolbarView {
     bool paletteOpen = false;
 };
 
+// 显示区域使用遮罩客户区的物理坐标，dpi 只决定此处的界面尺寸和字体。
+struct ToolbarArea {
+    RECT bounds;
+    UINT dpi;
+};
+
 // 截图遮罩内的原生子控件与自绘界面。矩形、鼠标坐标和绘图 DC 均使用遮罩客户区的物理像素。
 // 必须在所属 UI 线程上使用，Create 后由遮罩转发 WM_DRAWITEM、WM_NOTIFY 和 WM_HSCROLL。
 class CaptureToolbar {
@@ -52,10 +58,16 @@ public:
     bool Create(HWND parent, HINSTANCE instance, const ShortcutBindings& shortcuts) noexcept;
     void Close() noexcept;
 
-    // 在工作区内布置两级工具栏和独立标签。空选区时仅显示全屏、取消和开始提示。
-    // status 是可选的即时提示；本方法会复制文本。Hide 在拖动或打开系统对话框时隐藏所有控件。
-    void Layout(const RECT& work, const RECT& selection, UINT dpi, const ToolbarView& view,
-                const wchar_t* status) noexcept;
+    // work 是主栏所在显示器的工作区，labelScreen 是选区左上角所在显示器的范围。
+    // 空选区时显示全屏、取消和开始提示。status 是可选的即时提示，本方法会复制文本。
+    void Layout(const ToolbarArea& work, const ToolbarArea& labelScreen, const RECT& selection,
+                const ToolbarView& view, const wchar_t* status) noexcept;
+
+    // 只更新尺寸标签及其前后绘制区域，不移动或显示子控件。空选区会清除标签。
+    // screen 决定标签的缩放和可见边界，显示的宽高始终取自 selection 的物理像素。
+    void LayoutDimension(const ToolbarArea& screen, const RECT& selection) noexcept;
+
+    // 隐藏两级工具栏、色板和所有标签。拖动选区时可再单独调用 LayoutDimension。
     void Hide() noexcept;
     bool Contains(POINT client) const noexcept;
 
@@ -77,6 +89,8 @@ private:
     static LRESULT CALLBACK ButtonProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
                                        UINT_PTR id, DWORD_PTR data) noexcept;
     void InvalidateSurfaces() const noexcept;
+    // 判断标签候选位置是否会被工具栏、参数栏或色板占用。
+    bool OverlapsBars(const RECT& rect) const noexcept;
 
     HWND parent_ = nullptr;
     HWND tooltip_ = nullptr;
@@ -84,7 +98,9 @@ private:
     std::array<HWND, kCount> controls_{};
     std::array<std::array<wchar_t, 128>, kCount> tooltipText_{};
     FontHandle font_;
+    FontHandle dimensionFont_;
     UINT dpi_ = USER_DEFAULT_SCREEN_DPI;
+    UINT dimensionDpi_ = USER_DEFAULT_SCREEN_DPI;
     ToolbarView view_;
     RECT main_{}, options_{}, palette_{}, dimension_{}, status_{}, sizeLabel_{}, valueLabel_{};
     std::array<RECT, 5> separators_{};
