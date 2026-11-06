@@ -205,14 +205,14 @@ RECT FitImage(const Image& image, const RECT& canvas) noexcept {
     return {left, top, left + fittedWidth, top + fittedHeight};
 }
 
-void DrawImage(HDC dc, const Image& image, const RECT& destination) noexcept {
-    if (!image.empty() && !IsRectEmpty(&destination)) {
-        const auto info = image.BitmapInfo();
-        StretchDIBits(dc, destination.left, destination.top,
-                      destination.right - destination.left, destination.bottom - destination.top,
-                      0, 0, image.width(), image.height(), image.pixels().data(),
-                      &info, DIB_RGB_COLORS, SRCCOPY);
-    }
+bool DrawImage(HDC dc, const Image& image, const RECT& destination) noexcept {
+    if (image.empty() || IsRectEmpty(&destination)) return false;
+    const auto info = image.BitmapInfo();
+    const int copied = StretchDIBits(dc, destination.left, destination.top,
+                                    destination.right - destination.left, destination.bottom - destination.top,
+                                    0, 0, image.width(), image.height(), image.pixels().data(),
+                                    &info, DIB_RGB_COLORS, SRCCOPY);
+    return copied != 0 && copied != static_cast<int>(GDI_ERROR);
 }
 
 }  // namespace picolet

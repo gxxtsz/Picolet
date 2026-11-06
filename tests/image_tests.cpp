@@ -1,6 +1,7 @@
 #include "capture_edit.h"
 #include "export.h"
 #include "hotkeys.h"
+#include "pin_shadow.h"
 #include "win32.h"
 
 #include <wincodec.h>
@@ -63,6 +64,56 @@ void TestSelectionAdjustments() {
     const RECT reduced = ResizeSelection(selection, EdgeRight | EdgeBottom, {-4000, -4000}, desktop);
     const RECT expectedReduce{-180, -140, -179, -139};
     Check(EqualRect(&reduced, &expectedReduce), "缩放越过对边后没有保留最小的单像素选区");
+}
+
+void TestPinShadow() {
+    constexpr LONG inset = kPinShadowInset;
+    static_assert(inset == 12);
+    constexpr LONG width = 2 * inset + 3;
+    constexpr LONG height = 2 * inset + 2;
+    std::array<std::uint32_t, width * height> surface;
+    surface.fill(0xffb0b0b0u);
+    const auto pixel = [&](LONG x, LONG y) -> std::uint32_t& {
+        return surface[static_cast<std::size_t>(y) * width + x];
+    };
+    constexpr std::array<std::uint32_t, 6> image{
+        0x00123456u, 0xffffffffu, 0x8f000000u,
+        0x7fab34cdu, 0x00ffffffu, 0x00435719u,
+    };
+    for (LONG y = 0; y < 2; ++y) {
+        for (LONG x = 0; x < 3; ++x) pixel(inset + x, inset + y) = image[y * 3 + x];
+    }
+
+    ApplyPinShadow(surface, {width, height});
+
+    for (LONG y = 0; y < 2; ++y) {
+        for (LONG x = 0; x < 3; ++x) {
+            Check(pixel(inset + x, inset + y) == (image[y * 3 + x] | 0xff000000u),
+                  "贴图主体必须完全不透明并保留颜色");
+        }
+    }
+    Check(pixel(inset - 1, inset) == 0x66262626u, "阴影内缘应为 40% 不透明度的预乘深灰色");
+    Check((pixel(inset - 6, inset) >> 24) == 30, "阴影的透明度应按距离二次衰减");
+    std::uint32_t previousAlpha = 255;
+    for (LONG distance = 1; distance <= inset; ++distance) {
+        const auto side = pixel(inset - distance, inset);
+        const auto alpha = side >> 24;
+        Check(alpha < previousAlpha, "阴影从内向外必须逐渐变淡");
+        Check(side == pixel(inset + 2 + distance, inset) && side == pixel(inset, inset - distance) &&
+              side == pixel(inset, inset + 1 + distance), "图片四周的渐变宽度应相等");
+        previousAlpha = alpha;
+    }
+    const auto corner = pixel(inset - 1, inset - 1);
+    Check(corner != 0 && corner < pixel(inset - 1, inset) && corner == pixel(inset + 3, inset + 2),
+          "四角应以更远的径向距离淡出");
+    Check(pixel(0, inset) == 0 && pixel(1, 1) == 0, "阴影外缘应完全透明且颜色为零");
+
+    constexpr LONG tinySize = 2 * inset + 1;
+    std::array<std::uint32_t, tinySize * tinySize> tiny{};
+    tiny[inset * tinySize + inset] = 0x00102030u;
+    ApplyPinShadow(tiny, {tinySize, tinySize});
+    Check(tiny[inset * tinySize + inset] == 0xff102030u &&
+          tiny[inset * tinySize + inset + 1] == 0x66262626u, "单像素贴图的内容和阴影应各自完整");
 }
 
 void TestAnnotations() {
@@ -358,6 +409,7 @@ int main() {
     try {
         TestCrop();
         TestSelectionAdjustments();
+        TestPinShadow();
         TestAnnotations();
         TestMosaicDraft();
         TestShapeAnnotations();

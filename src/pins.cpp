@@ -1,20 +1,18 @@
 #include "pins.h"
 
+#include "pin_shadow.h"
 #include "win32.h"
 
 #include <windowsx.h>
 
 #include <algorithm>
-#include <array>
 #include <cmath>
+#include <limits>
 
 namespace picolet {
 namespace {
 
 constexpr wchar_t kPinClass[] = L"Picolet.Pin";
-constexpr std::array<COLORREF, 2> kFrameColors{RGB(38, 38, 38), RGB(245, 245, 245)};
-// FrameRect 每道边占一个物理像素。窗口比实际图片四周各多出这段距离。
-constexpr LONG kFrameInset = static_cast<LONG>(kFrameColors.size());
 
 RECT WorkArea(HMONITOR monitor) noexcept {
     MONITORINFO info{};
@@ -25,14 +23,18 @@ RECT WorkArea(HMONITOR monitor) noexcept {
     return work;
 }
 
-RECT KeepReachable(RECT window, const RECT& work, UINT dpi) noexcept {
-    if (IsRectEmpty(&work)) return window;
-    const LONG width = window.right - window.left;
-    const LONG height = window.bottom - window.top;
-    const LONG gripX = std::min({width, work.right - work.left, static_cast<LONG>(Dip(36, dpi))});
-    const LONG gripY = std::min({height, work.bottom - work.top, static_cast<LONG>(Dip(36, dpi))});
-    const LONG left = std::clamp(window.left, work.left + gripX - width, work.right - gripX);
-    const LONG top = std::clamp(window.top, work.top + gripY - height, work.bottom - gripY);
+// 把图片主体的一部分留在目标工作区，确保移到屏幕边缘后仍能抓取。
+// imageBounds 使用桌面物理坐标，四周的阴影不计入可抓取的尺寸。
+RECT KeepReachable(RECT imageBounds, const RECT& work, HWND window) noexcept {
+    if (IsRectEmpty(&work)) return imageBounds;
+    const LONG width = imageBounds.right - imageBounds.left;
+    const LONG height = imageBounds.bottom - imageBounds.top;
+    const UINT dpi = GetDpiForWindow(window);
+    const LONG grip = Dip(36, dpi ? dpi : USER_DEFAULT_SCREEN_DPI);
+    const LONG gripX = std::min({width, work.right - work.left, grip});
+    const LONG gripY = std::min({height, work.bottom - work.top, grip});
+    const LONG left = std::clamp(imageBounds.left, work.left + gripX - width, work.right - gripX);
+    const LONG top = std::clamp(imageBounds.top, work.top + gripY - height, work.bottom - gripY);
     return {left, top, left + width, top + height};
 }
 
@@ -63,23 +65,68 @@ struct PinWindows::Pin {
         return self ? self->Handle(message, wparam, lparam) : DefWindowProcW(hwnd, message, wparam, lparam);
     }
 
-    // rect 是含边框的窗口范围，按指定屏幕限制位置以保留可抓取区域。
-    bool Place(RECT rect, HMONITOR monitor) const noexcept {
-        const auto dpi = GetDpiForWindow(window);
-        rect = KeepReachable(rect, WorkArea(monitor), dpi ? dpi : USER_DEFAULT_SCREEN_DPI);
-        return SetWindowPos(window, HWND_TOPMOST, rect.left, rect.top, rect.right - rect.left,
-                            rect.bottom - rect.top, SWP_NOACTIVATE) != FALSE;
+    // 按新的图片主体矩形合成窗口。imageBounds 是桌面物理坐标，四周另加固定宽度的阴影。
+    // 先完成离屏绘制，再一次性提交位置、尺寸和像素。提交失败时调用方保留原有缩放倍率。
+    HRESULT Present(const RECT& imageBounds) const noexcept {
+        const LONG width = imageBounds.right - imageBounds.left;
+        const LONG height = imageBounds.bottom - imageBounds.top;
+        SIZE size{width + 2 * kPinShadowInset, height + 2 * kPinShadowInset};
+        const auto count = static_cast<std::uint64_t>(size.cx) * size.cy;
+        if (count > std::numeric_limits<DWORD>::max() / sizeof(std::uint32_t)) {
+            return HRESULT_FROM_WIN32(ERROR_ARITHMETIC_OVERFLOW);
+        }
+
+        const MemoryDc dc(CreateCompatibleDC(nullptr));
+        if (!dc) return E_FAIL;
+        BITMAPINFO info{};
+        info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        info.bmiHeader.biWidth = size.cx;
+        info.bmiHeader.biHeight = -size.cy;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        info.bmiHeader.biCompression = BI_RGB;
+        info.bmiHeader.biSizeImage = static_cast<DWORD>(count * sizeof(std::uint32_t));
+        void* bits = nullptr;
+        SetLastError(ERROR_SUCCESS);
+        const BitmapHandle bitmap(CreateDIBSection(dc.get(), &info, DIB_RGB_COLORS, &bits, nullptr, 0));
+        if (!bitmap || !bits) return LastErrorResult();
+        const HGDIOBJ original = SelectObject(dc.get(), bitmap.get());
+        if (!original || original == HGDI_ERROR) return E_FAIL;
+
+        const RECT destination{kPinShadowInset, kPinShadowInset, kPinShadowInset + width, kPinShadowInset + height};
+        HRESULT result = E_FAIL;
+        if (SetStretchBltMode(dc.get(), HALFTONE) && SetBrushOrgEx(dc.get(), 0, 0, nullptr) &&
+            DrawImage(dc.get(), image, destination) && GdiFlush()) {
+            ApplyPinShadow({static_cast<std::uint32_t*>(bits), static_cast<std::size_t>(count)}, size);
+            POINT position{imageBounds.left - kPinShadowInset, imageBounds.top - kPinShadowInset};
+            POINT source{};
+            BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+            SetLastError(ERROR_SUCCESS);
+            result = UpdateLayeredWindow(window, nullptr, &position, &size, dc.get(), &source, 0, &blend, ULW_ALPHA)
+                ? S_OK : LastErrorResult();
+        }
+        SelectObject(dc.get(), original);
+        return result;
     }
 
-    // 按滚轮倍率调整内框中的图片。光标落在边框上时，固定离光标最近的图片边缘。
+    // bounds 含阴影，移动时只修改窗口位置，复用系统保存的分层位图。
+    void Move(RECT bounds, HMONITOR monitor) const noexcept {
+        InflateRect(&bounds, -kPinShadowInset, -kPinShadowInset);
+        const RECT visible = KeepReachable(bounds, WorkArea(monitor), window);
+        SetWindowPos(window, HWND_TOPMOST, visible.left - kPinShadowInset, visible.top - kPinShadowInset,
+                     0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+
+    // 调整图片显示倍率，以光标下的图像位置为锚。指向可见阴影时，取最近的图片边缘。
+    // 分层窗口的全透明像素不命中，滚轮消息即使由焦点窗口收到也不会触发缩放。
     void Zoom(int wheel) noexcept {
         if (dragging || !wheel) return;
         RECT previous{};
         POINT cursor{};
-        if (!GetWindowRect(window, &previous) || !GetCursorPos(&cursor) || !PtInRect(&previous, cursor)) return;
+        if (!GetWindowRect(window, &previous) || !GetCursorPos(&cursor) || WindowFromPoint(cursor) != window) return;
         const HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
         const RECT work = WorkArea(monitor);
-        // 放大仅改变窗口大小。保留光标下的图像位置，同时限制过大的窗口尺寸。
+        // 限制离屏位图尺寸，保留小图的最小显示倍率。
         const double ceiling = std::max(minScale, std::min({4.0,
             static_cast<double>(work.right - work.left) * 4.0 / image.width(),
             static_cast<double>(work.bottom - work.top) * 4.0 / image.height()}));
@@ -87,44 +134,26 @@ struct PinWindows::Pin {
         if (scale == next) return;
         const LONG width = std::max(1L, std::lround(image.width() * next));
         const LONG height = std::max(1L, std::lround(image.height() * next));
-        InflateRect(&previous, -kFrameInset, -kFrameInset);
+        InflateRect(&previous, -kPinShadowInset, -kPinShadowInset);
+        const LONG previousWidth = previous.right - previous.left;
+        const LONG previousHeight = previous.bottom - previous.top;
+        if (width == previousWidth && height == previousHeight) {
+            scale = next;
+            return;
+        }
         const POINT anchor{std::clamp(cursor.x, previous.left, previous.right),
                            std::clamp(cursor.y, previous.top, previous.bottom)};
-        const LONG x = anchor.x - std::lround(static_cast<double>(anchor.x - previous.left) * width /
-                                             (previous.right - previous.left));
-        const LONG y = anchor.y - std::lround(static_cast<double>(anchor.y - previous.top) * height /
-                                             (previous.bottom - previous.top));
-        RECT outer{x, y, x + width, y + height};
-        InflateRect(&outer, kFrameInset, kFrameInset);
-        if (Place(outer, monitor)) {
+        const LONG x = anchor.x - std::lround(static_cast<double>(anchor.x - previous.left) * width / previousWidth);
+        const LONG y = anchor.y - std::lround(static_cast<double>(anchor.y - previous.top) * height / previousHeight);
+        const RECT target = KeepReachable({x, y, x + width, y + height}, work, window);
+        if (SUCCEEDED(Present(target))) {
             scale = next;
-            InvalidateRect(window, nullptr, FALSE);
+            SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
     }
 
     LRESULT Handle(UINT message, WPARAM wparam, LPARAM lparam) noexcept {
         switch (message) {
-        case WM_ERASEBKGND:
-            return 1;
-        case WM_PAINT: {
-            PAINTSTRUCT paint{};
-            HDC dc = BeginPaint(window, &paint);
-            if (dc) {
-                RECT client{};
-                GetClientRect(window, &client);
-                const auto brush = static_cast<HBRUSH>(GetStockObject(DC_BRUSH));
-                for (const COLORREF color : kFrameColors) {
-                    SetDCBrushColor(dc, color);
-                    FrameRect(dc, &client, brush);
-                    InflateRect(&client, -1, -1);
-                }
-                SetStretchBltMode(dc, HALFTONE);
-                SetBrushOrgEx(dc, 0, 0, nullptr);
-                DrawImage(dc, image, client);
-            }
-            EndPaint(window, &paint);
-            return 0;
-        }
         case WM_LBUTTONDOWN:
             if (GetWindowRect(window, &dragRect) && GetCursorPos(&dragStart)) {
                 SetCapture(window);
@@ -137,7 +166,7 @@ struct PinWindows::Pin {
                 if (GetCursorPos(&cursor)) {
                     RECT rect = dragRect;
                     OffsetRect(&rect, cursor.x - dragStart.x, cursor.y - dragStart.y);
-                    Place(rect, MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST));
+                    Move(rect, MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST));
                 }
             }
             return 0;
@@ -153,11 +182,11 @@ struct PinWindows::Pin {
             Zoom(GET_WHEEL_DELTA_WPARAM(wparam));
             return 0;
         case WM_DPICHANGED:
-            // 贴图使用物理像素。换屏时不接受按 DPI 改变图像比例的建议尺寸。
+            // 图片尺寸和阴影宽度都使用物理像素，换屏时沿用当前分层位图尺寸。
             return 0;
         case WM_DISPLAYCHANGE: {
             RECT rect{};
-            if (GetWindowRect(window, &rect)) Place(rect, MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST));
+            if (GetWindowRect(window, &rect)) Move(rect, MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST));
             return 0;
         }
         case WM_RBUTTONUP:
@@ -194,7 +223,7 @@ HRESULT PinWindows::Open(HINSTANCE instance, HWND owner, Image&& image, const RE
     auto& pin = *pins_.back();
     const RECT work = WorkArea(MonitorFromRect(&selection, MONITOR_DEFAULTTONEAREST));
     RECT available = work;
-    InflateRect(&available, -kFrameInset, -kFrameInset);
+    InflateRect(&available, -kPinShadowInset, -kPinShadowInset);
     const RECT fitted = FitImage(image, available);
     const LONG width = fitted.right - fitted.left;
     const LONG height = fitted.bottom - fitted.top;
@@ -205,20 +234,25 @@ HRESULT PinWindows::Open(HINSTANCE instance, HWND owner, Image&& image, const RE
     pin.scale = std::min(static_cast<double>(width) / image.width(), static_cast<double>(height) / image.height());
     pin.minScale = std::min(0.1, pin.scale);
     pin.image = std::move(image);
-    const LONG outerWidth = width + 2 * kFrameInset;
-    const LONG outerHeight = height + 2 * kFrameInset;
-    const LONG x = std::clamp(selection.left - kFrameInset, work.left, work.right - outerWidth);
-    const LONG y = std::clamp(selection.top - kFrameInset, work.top, work.bottom - outerHeight);
-    const HWND window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, kPinClass, L"Picolet 贴图",
-                                        WS_POPUP, x, y, outerWidth, outerHeight, owner, nullptr, instance, &pin);
-    if (!window || !SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0,
-                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
-        const auto error = LastErrorResult();
+    const LONG x = std::clamp(selection.left, available.left, available.right - width);
+    const LONG y = std::clamp(selection.top, available.top, available.bottom - height);
+    SetLastError(ERROR_SUCCESS);
+    const HWND window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED, kPinClass, L"Picolet 贴图",
+                                        WS_POPUP, x - kPinShadowInset, y - kPinShadowInset,
+                                        width + 2 * kPinShadowInset, height + 2 * kPinShadowInset,
+                                        owner, nullptr, instance, &pin);
+    HRESULT result = window ? pin.Present({x, y, x + width, y + height}) : LastErrorResult();
+    if (SUCCEEDED(result)) {
+        SetLastError(ERROR_SUCCESS);
+        if (!SetWindowPos(window, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)) {
+            result = LastErrorResult();
+        }
+    }
+    if (FAILED(result)) {
         if (window) DestroyWindow(window);
         pins_.pop_back();
-        return error;
     }
-    return S_OK;
+    return result;
 }
 
 void PinWindows::CloseAll() noexcept {

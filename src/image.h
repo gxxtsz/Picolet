@@ -51,7 +51,9 @@ HRESULT CropImage(const DesktopFrame& frame, const RECT& screenRect, Image& resu
 // 在指定矩形中等比居中摆放图片，最多按原始尺寸显示。用于贴图初始摆放，不修改原图。
 RECT FitImage(const Image& image, const RECT& canvas) noexcept;
 
-// 绘制完整的自顶向下位图。调用方可以通过设备上下文的裁剪区限制重绘范围。
-void DrawImage(HDC dc, const Image& image, const RECT& destination) noexcept;
+// 把完整的自顶向下位图缩放到 destination。调用方可通过设备上下文的裁剪区限制绘制范围。
+// 成功传输像素时返回 true，图像或目标为空、GDI 传输失败时返回 false。
+// 调用方直接访问 DIB 前须同步 GDI，用于分层合成时须自行补齐目标像素的 Alpha。
+bool DrawImage(HDC dc, const Image& image, const RECT& destination) noexcept;
 
 }  // namespace picolet
