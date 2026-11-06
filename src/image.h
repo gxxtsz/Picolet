@@ -48,7 +48,7 @@ RECT SelectionRect(POINT first, POINT last, const RECT& bounds) noexcept;
 // 接收带符号的桌面坐标，输出独立、未缩放的选区图像。
 HRESULT CropImage(const DesktopFrame& frame, const RECT& screenRect, Image& result) noexcept;
 
-// 预览按比例居中，最多按原始尺寸绘制。导出不使用这个显示矩形。
+// 在指定矩形中等比居中摆放图片，最多按原始尺寸显示。用于贴图初始摆放，不修改原图。
 RECT FitImage(const Image& image, const RECT& canvas) noexcept;
 
 // 绘制完整的自顶向下位图。调用方可以通过设备上下文的裁剪区限制重绘范围。

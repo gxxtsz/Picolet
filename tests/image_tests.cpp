@@ -1,4 +1,6 @@
+#include "capture_edit.h"
 #include "export.h"
+#include "hotkeys.h"
 #include "win32.h"
 
 #include <wincodec.h>
@@ -45,6 +47,108 @@ void TestCrop() {
     Check(EqualRect(&clipped, &frame.bounds) != FALSE, "越界拖动未裁到桌面边缘");
     const RECT click = SelectionRect({-2, -2}, {-2, -2}, frame.bounds);
     Check(IsRectEmpty(&click) != FALSE, "单击应保留框选状态");
+}
+
+void TestSelectionAdjustments() {
+    const RECT desktop{-1920, -240, 2560, 1440};
+    const RECT selection{-180, -140, 220, 60};
+    const RECT moved = MoveSelection(selection, {-4000, 1600}, desktop);
+    const RECT expectedMove{-1920, 1240, -1520, 1440};
+    Check(EqualRect(&moved, &expectedMove), "移动越界后未保持选区尺寸");
+
+    const RECT expanded = ResizeSelection(selection, EdgeLeft | EdgeTop, {-4000, -4000}, desktop);
+    const RECT expectedExpand{-1920, -240, 220, 60};
+    Check(EqualRect(&expanded, &expectedExpand), "左上角缩放移动了对边或超出屏幕");
+
+    const RECT reduced = ResizeSelection(selection, EdgeRight | EdgeBottom, {-4000, -4000}, desktop);
+    const RECT expectedReduce{-180, -140, -179, -139};
+    Check(EqualRect(&reduced, &expectedReduce), "缩放越过对边后没有保留最小的单像素选区");
+}
+
+void TestAnnotations() {
+    DesktopFrame frame;
+    frame.bounds = {-12, -6, 12, 6};
+    Check(SUCCEEDED(frame.image.Resize(24, 12)), "创建标注测试帧失败");
+    for (int y = 0; y < frame.image.height(); ++y) {
+        for (int x = 0; x < frame.image.width(); ++x) {
+            frame.image.pixels()[static_cast<std::size_t>(y) * 24 + x] = (x % 2) ? 0xffffffff : 0xff000000;
+        }
+    }
+
+    // 先画笔再打码，比较马赛克和未遮挡区域，随后撤销并移动选区检查标注是否留在原处。
+    AnnotationHistory history;
+    Annotation stroke;
+    stroke.tool = EditTool::Pen;
+    stroke.clip = frame.bounds;
+    stroke.first = {-10, 0};
+    stroke.last = {5, 0};
+    stroke.path = {stroke.first, stroke.last};
+    stroke.color = RGB(255, 0, 0);
+    Check(history.Commit(frame, std::move(stroke)) == S_OK, "无法提交画笔标注");
+    Image annotated;
+    Check(SUCCEEDED(history.Render(frame, frame.bounds, annotated)), "合成标注图失败");
+    Check(annotated.pixels()[6 * 24 + 4] == 0xffff0000, "画笔颜色、坐标或透明度错误");
+
+    const RECT tile{-12, -6, 0, 6};
+    Annotation mosaic;
+    mosaic.tool = EditTool::Mosaic;
+    mosaic.clip = frame.bounds;
+    mosaic.first = {tile.left, tile.top};
+    mosaic.last = {tile.right - 1, tile.bottom - 1};
+    Check(history.Commit(frame, std::move(mosaic)) == S_OK, "无法提交马赛克标注");
+    Image composed;
+    Check(SUCCEEDED(history.Render(frame, frame.bounds, composed)), "合成马赛克图失败");
+    std::uint32_t red = 0, green = 0, blue = 0;
+    for (std::size_t y = 0; y < 12; ++y) {
+        for (std::size_t x = 0; x < 12; ++x) {
+            const auto pixel = annotated.pixels()[y * 24 + x];
+            red += (pixel >> 16) & 0xff;
+            green += (pixel >> 8) & 0xff;
+            blue += pixel & 0xff;
+        }
+    }
+    const auto average = 0xff000000u | ((red / 144) << 16) | ((green / 144) << 8) | (blue / 144);
+    for (std::size_t y = 0; y < 12; ++y) {
+        for (std::size_t x = 0; x < 24; ++x) {
+            const auto offset = y * 24 + x;
+            Check(composed.pixels()[offset] == (x < 12 ? average : annotated.pixels()[offset]),
+                  "马赛克没有处理已合成的像素或改变了范围外的内容");
+        }
+    }
+    Check(SUCCEEDED(history.Render(frame, {-4, -2, 2, 2}, composed)) && composed.pixels()[0] == average,
+          "改变选区后重算了马赛克块或移动了标注");
+
+    Check(history.Undo(frame) == S_OK && SUCCEEDED(history.Render(frame, frame.bounds, composed)) &&
+          std::ranges::equal(composed.pixels(), annotated.pixels()), "撤销马赛克没有恢复上一笔");
+    Check(history.Undo(frame) == S_OK && history.empty() && SUCCEEDED(history.Render(frame, frame.bounds, composed)) &&
+          std::ranges::equal(composed.pixels(), frame.image.pixels()), "撤销所有标注没有恢复原图");
+}
+
+void TestShortcuts() {
+    const auto defaults = DefaultShortcuts();
+    Check(defaults[0] == Hotkey{0, VK_F1}, "全新设置的全局截图键不是 F1");
+    constexpr DWORD old = MAKELONG(MAKEWORD('G', MOD_CONTROL | MOD_SHIFT), MAKEWORD('F', MOD_CONTROL | MOD_ALT));
+    auto migrated = DecodeBindings({}, old);
+    Check(migrated[0] == Hotkey{MOD_CONTROL | MOD_SHIFT, 'G'} &&
+          migrated[ShortcutIndex(Shortcut::Fullscreen)] == defaults[ShortcutIndex(Shortcut::Fullscreen)],
+          "旧选区键未迁移，或错误迁移了旧全屏键");
+
+    const Hotkey custom{MOD_WIN | MOD_SHIFT, VK_OEM_PLUS};
+    migrated[0] = custom;
+    migrated[ShortcutIndex(Shortcut::Copy)] = custom;
+    migrated[ShortcutIndex(Shortcut::Undo)] = {};
+    const auto saved = EncodeBindings(migrated);
+    Check(DecodeBindings(saved, old) == migrated && ValidateBindings(migrated).error == ShortcutError::None,
+          "未能还原清除项或拒绝了跨作用域复用的按键");
+    Check(MatchLocalShortcut(migrated, custom) == Shortcut::Copy &&
+          !MatchLocalShortcut(migrated, {MOD_WIN, VK_OEM_PLUS}), "局部快捷键未按作用域和完整修饰键匹配");
+
+    migrated[ShortcutIndex(Shortcut::Save)] = custom;
+    const auto duplicate = ValidateBindings(migrated);
+    Check(duplicate.error == ShortcutError::Duplicate && duplicate.slot == Shortcut::Save, "未发现同组快捷键冲突");
+    Check(DecodeBindings(EncodeBindings(migrated), {}) == defaults, "损坏的设置没有回退到默认值");
+    migrated[0] = {0, VK_F12};
+    Check(ValidateBindings(migrated).error == ShortcutError::Reserved, "全局快捷键接受了系统保留的 F12");
 }
 
 // 通过系统解码器读取实际写出的文件，检测像素通道、透明度、行方向和尺寸的错误。
@@ -119,6 +223,9 @@ int main() {
     int status = 0;
     try {
         TestCrop();
+        TestSelectionAdjustments();
+        TestAnnotations();
+        TestShortcuts();
         TestPng();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

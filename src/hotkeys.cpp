@@ -2,166 +2,224 @@
 
 #include "win32.h"
 
-#include <algorithm>
 #include <cwchar>
 
 namespace picolet {
 namespace {
 
 constexpr wchar_t kRegistryKey[] = L"Software\\Picolet\\Screenshot";
-constexpr wchar_t kRegistryValue[] = L"Hotkeys";
-constexpr UINT kModifierMask = MOD_CONTROL | MOD_ALT | MOD_SHIFT;
-constexpr HotkeyPair kDefaults{{{kModifierMask, 'S'}, {kModifierMask, 'F'}}};
+constexpr wchar_t kRegistryValue[] = L"Shortcuts";
+constexpr wchar_t kLegacyValue[] = L"Hotkeys";
+constexpr WORD kBindingVersion = 1;
+constexpr ShortcutBindings kDefaults{{{0, VK_F1}, {MOD_CONTROL, 'A'}, {MOD_CONTROL, 'C'},
+    {MOD_CONTROL, 'S'}, {MOD_CONTROL, 'T'}, {MOD_CONTROL, 'Z'}, {0, VK_ESCAPE}}};
 
-bool IsValid(const Hotkey& hotkey) noexcept {
-    const auto key = hotkey.key;
-    const bool validKey = (key >= 'A' && key <= 'Z') || (key >= '0' && key <= '9') ||
-                          (key >= VK_F1 && key <= VK_F11);
-    return validKey && std::ranges::find(kModifiers, hotkey.modifiers) != kModifiers.end();
+Hotkey Decode(WORD word) noexcept { return {HIBYTE(word), LOBYTE(word)}; }
+
+bool IsLegacyArea(Hotkey binding) noexcept {
+    const auto mods = binding.modifiers;
+    const auto key = binding.key;
+    return (mods == (MOD_CONTROL | MOD_ALT) || mods == (MOD_CONTROL | MOD_SHIFT) ||
+            mods == (MOD_ALT | MOD_SHIFT) || mods == (MOD_CONTROL | MOD_ALT | MOD_SHIFT)) &&
+           ((key >= 'A' && key <= 'Z') || (key >= '0' && key <= '9') || (key >= VK_F1 && key <= VK_F11));
 }
 
-Hotkey Decode(WORD value) noexcept {
-    return {HIBYTE(value), LOBYTE(value)};
+ShortcutBindings LoadBindings() noexcept {
+    ShortcutWords words{};
+    DWORD size = static_cast<DWORD>(sizeof(words));
+    const bool hasWords = RegGetValueW(HKEY_CURRENT_USER, kRegistryKey, kRegistryValue, RRF_RT_REG_BINARY,
+                                       nullptr, words.data(), &size) == ERROR_SUCCESS && size == sizeof(words);
+    DWORD legacy = 0;
+    size = sizeof(legacy);
+    const bool hasLegacy = RegGetValueW(HKEY_CURRENT_USER, kRegistryKey, kLegacyValue, RRF_RT_REG_DWORD,
+                                       nullptr, &legacy, &size) == ERROR_SUCCESS && size == sizeof(legacy);
+    return DecodeBindings(hasWords ? std::span<const WORD>(words) : std::span<const WORD>{},
+                          hasLegacy ? std::optional<DWORD>(legacy) : std::nullopt);
 }
 
-WORD Encode(const Hotkey& hotkey) noexcept {
-    return MAKEWORD(hotkey.key, hotkey.modifiers);
-}
-
-HotkeyPair LoadBindings() noexcept {
-    DWORD data{};
-    DWORD size = sizeof(data);
-    if (RegGetValueW(HKEY_CURRENT_USER, kRegistryKey, kRegistryValue, RRF_RT_REG_DWORD,
-                     nullptr, &data, &size) == ERROR_SUCCESS && size == sizeof(data)) {
-        const HotkeyPair saved{Decode(LOWORD(data)), Decode(HIWORD(data))};
-        if (IsValid(saved[0]) && IsValid(saved[1]) && saved[0] != saved[1]) {
-            return saved;
-        }
-    }
-    return kDefaults;
-}
-
-HRESULT SaveBindings(const HotkeyPair& bindings) noexcept {
-    HKEY rawKey = nullptr;
-    const LSTATUS created = RegCreateKeyExW(HKEY_CURRENT_USER, kRegistryKey, 0, nullptr, 0,
-                                           KEY_SET_VALUE, nullptr, &rawKey, nullptr);
-    if (created != ERROR_SUCCESS) {
-        return HRESULT_FROM_WIN32(created);
-    }
-    const UniqueHandle<HKEY, RegCloseKey> key(rawKey);
-    // 把两项一起写入一个值，避免进程在两次写入之间退出而留下半套设置。
-    const DWORD packed = MAKELONG(Encode(bindings[0]), Encode(bindings[1]));
-    return HRESULT_FROM_WIN32(RegSetValueExW(key.get(), kRegistryValue, 0, REG_DWORD,
-                                            reinterpret_cast<const BYTE*>(&packed), sizeof(packed)));
+bool SaveBindings(const ShortcutBindings& bindings) noexcept {
+    HKEY raw = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRegistryKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &raw, nullptr)
+        != ERROR_SUCCESS) return false;
+    const UniqueHandle<HKEY, RegCloseKey> key(raw);
+    const auto words = EncodeBindings(bindings);
+    return RegSetValueExW(key.get(), kRegistryValue, 0, REG_BINARY, reinterpret_cast<const BYTE*>(words.data()),
+                          static_cast<DWORD>(sizeof(words))) == ERROR_SUCCESS;
 }
 
 }  // namespace
 
-const wchar_t* ModifierText(UINT modifiers) noexcept {
-    switch (modifiers) {
-    case MOD_CONTROL | MOD_ALT: return L"Ctrl+Alt";
-    case MOD_CONTROL | MOD_SHIFT: return L"Ctrl+Shift";
-    case MOD_ALT | MOD_SHIFT: return L"Alt+Shift";
-    default: return L"Ctrl+Alt+Shift";
+const wchar_t* ShortcutName(Shortcut command) noexcept {
+    constexpr const wchar_t* names[]{L"开始截图", L"全屏", L"复制", L"另存为 PNG", L"贴图", L"撤销", L"取消"};
+    const auto index = ShortcutIndex(command);
+    return index < kShortcutCount ? names[index] : L"";
+}
+
+ShortcutBindings DefaultShortcuts() noexcept { return kDefaults; }
+
+bool IsMainKey(UINT key) noexcept {
+    if ((key < VK_BACK && key != VK_CANCEL) || key >= 0xff) return false;
+    switch (key) {
+    case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT:
+    case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL:
+    case VK_MENU: case VK_LMENU: case VK_RMENU:
+    case VK_LWIN: case VK_RWIN: case VK_PACKET: case VK_PROCESSKEY:
+        return false;
+    default:
+        return true;
     }
 }
 
-void FormatKey(UINT key, wchar_t (&text)[4]) noexcept {
-    if (key >= VK_F1 && key <= VK_F11) {
-        std::swprintf(text, 4, L"F%u", key - VK_F1 + 1);
-    } else {
-        text[0] = static_cast<wchar_t>(key);
-        text[1] = L'\0';
+UINT CurrentModifiers() noexcept {
+    return ((GetKeyState(VK_CONTROL) < 0) ? MOD_CONTROL : 0) |
+           ((GetKeyState(VK_MENU) < 0) ? MOD_ALT : 0) |
+           ((GetKeyState(VK_SHIFT) < 0) ? MOD_SHIFT : 0) |
+           ((GetKeyState(VK_LWIN) < 0 || GetKeyState(VK_RWIN) < 0) ? MOD_WIN : 0);
+}
+
+void FormatHotkey(Hotkey hotkey, wchar_t (&label)[96]) noexcept {
+    if (!hotkey.key) {
+        lstrcpynW(label, L"未设置", 96);
+        return;
     }
+    wchar_t key[64]{};
+    if ((hotkey.key >= 'A' && hotkey.key <= 'Z') || (hotkey.key >= '0' && hotkey.key <= '9')) {
+        key[0] = static_cast<wchar_t>(hotkey.key);
+    } else if (hotkey.key >= VK_F1 && hotkey.key <= VK_F24) {
+        std::swprintf(key, std::size(key), L"F%u", hotkey.key - VK_F1 + 1);
+    } else if (hotkey.key >= VK_NUMPAD0 && hotkey.key <= VK_NUMPAD9) {
+        std::swprintf(key, std::size(key), L"小键盘 %u", hotkey.key - VK_NUMPAD0);
+    } else {
+        const wchar_t* name = nullptr;
+        switch (hotkey.key) {
+        case VK_ESCAPE: name = L"Esc"; break;
+        case VK_RETURN: name = L"Enter"; break;
+        case VK_SNAPSHOT: name = L"Print Screen"; break;
+        case VK_SPACE: name = L"空格"; break;
+        case VK_BACK: name = L"退格"; break;
+        case VK_DELETE: name = L"Delete"; break;
+        default: break;
+        }
+        if (name) {
+            lstrcpynW(key, name, static_cast<int>(std::size(key)));
+        } else {
+            const UINT scan = MapVirtualKeyW(hotkey.key, MAPVK_VK_TO_VSC_EX);
+            const LONG param = static_cast<LONG>(((scan & 0xff) << 16) | (scan & 0xff00 ? (1u << 24) : 0));
+            if (!scan || !GetKeyNameTextW(param, key, static_cast<int>(std::size(key)))) {
+                std::swprintf(key, std::size(key), L"按键 0x%02X", hotkey.key);
+            }
+        }
+    }
+    std::swprintf(label, std::size(label), L"%ls%ls%ls%ls%ls",
+                  (hotkey.modifiers & MOD_CONTROL) ? L"Ctrl+" : L"",
+                  (hotkey.modifiers & MOD_ALT) ? L"Alt+" : L"",
+                  (hotkey.modifiers & MOD_SHIFT) ? L"Shift+" : L"",
+                  (hotkey.modifiers & MOD_WIN) ? L"Win+" : L"", key);
+}
+
+ShortcutResult ValidateBindings(const ShortcutBindings& bindings) noexcept {
+    for (std::size_t i = 0; i < bindings.size(); ++i) {
+        const Hotkey binding = bindings[i];
+        const auto command = static_cast<Shortcut>(i);
+        if (binding.key ? (!IsMainKey(binding.key) || (binding.modifiers & ~kShortcutModifiers)) : binding.modifiers) {
+            return {ShortcutError::InvalidKey, command};
+        }
+        if (command == Shortcut::Capture && binding.key == VK_F12) return {ShortcutError::Reserved, command};
+        if (!binding.key) continue;
+        for (std::size_t previous = 1; previous < i; ++previous) {
+            if (binding == bindings[previous]) return {ShortcutError::Duplicate, command};
+        }
+    }
+    return {};
+}
+
+std::optional<Shortcut> MatchLocalShortcut(const ShortcutBindings& bindings, Hotkey received) noexcept {
+    if (received.key) {
+        for (std::size_t i = 1; i < bindings.size(); ++i) {
+            if (bindings[i] == received) return static_cast<Shortcut>(i);
+        }
+    }
+    return std::nullopt;
+}
+
+ShortcutWords EncodeBindings(const ShortcutBindings& bindings) noexcept {
+    ShortcutWords words{};
+    words[0] = kBindingVersion;
+    for (std::size_t i = 0; i < bindings.size(); ++i) words[i + 1] = MAKEWORD(bindings[i].key, bindings[i].modifiers);
+    return words;
+}
+
+ShortcutBindings DecodeBindings(std::span<const WORD> words, std::optional<DWORD> legacy) noexcept {
+    if (words.size() == kShortcutCount + 1 && words.front() == kBindingVersion) {
+        ShortcutBindings bindings{};
+        for (std::size_t i = 0; i < bindings.size(); ++i) bindings[i] = Decode(words[i + 1]);
+        if (ValidateBindings(bindings).error == ShortcutError::None) return bindings;
+    }
+    ShortcutBindings bindings = kDefaults;
+    if (legacy) {
+        const auto area = Decode(LOWORD(*legacy));
+        if (IsLegacyArea(area)) bindings[0] = area;
+    }
+    return bindings;
 }
 
 void Hotkeys::Start(HWND owner) noexcept {
     owner_ = owner;
     bindings_ = LoadBindings();
-    for (std::size_t index = 0; index < bindings_.size(); ++index) {
-        const auto& hotkey = bindings_[index];
-        const int id = static_cast<int>(index) + 1;
-        if (RegisterHotKey(owner_, id, hotkey.modifiers | MOD_NOREPEAT, hotkey.key)) {
-            ids_[index] = id;
-        }
-    }
+    Resume();
 }
 
 void Hotkeys::Stop() noexcept {
-    for (const int id : ids_) {
-        if (id != 0) {
-            UnregisterHotKey(owner_, id);
-        }
-    }
-    ids_.fill(0);
+    Pause();
     owner_ = nullptr;
 }
 
-HRESULT Hotkeys::Apply(const HotkeyPair& requested, std::size_t& failedIndex) noexcept {
-    failedIndex = requested.size();
-    if (!IsValid(requested[0]) || !IsValid(requested[1]) || requested[0] == requested[1]) {
-        return E_INVALIDARG;
-    }
-
-    std::array<int, 2> staged{};
-    HRESULT status = S_OK;
-    for (std::size_t index = 0; index < requested.size(); ++index) {
-        const auto& hotkey = requested[index];
-        for (std::size_t previous = 0; previous < bindings_.size(); ++previous) {
-            if (hotkey == bindings_[previous]) {
-                staged[index] = ids_[previous];
-                break;
-            }
-        }
-        if (staged[index] != 0) {
-            continue;
-        }
-
-        // 旧组合至多两个，新组合至多两个。挑一个尚未使用的注册编号。
-        int id = 1;
-        while (std::ranges::find(ids_, id) != ids_.end() ||
-               std::ranges::find(staged, id) != staged.end()) {
-            ++id;
-        }
-        SetLastError(ERROR_SUCCESS);
-        if (!RegisterHotKey(owner_, id, hotkey.modifiers | MOD_NOREPEAT, hotkey.key)) {
-            failedIndex = index;
-            status = LastErrorResult();
-            break;
-        }
-        staged[index] = id;
-    }
-    if (SUCCEEDED(status)) {
-        status = SaveBindings(requested);
-    }
-    if (FAILED(status)) {
-        for (const int id : staged) {
-            if (id != 0 && std::ranges::find(ids_, id) == ids_.end()) {
-                UnregisterHotKey(owner_, id);
-            }
-        }
-        return status;
-    }
-
-    for (const int id : ids_) {
-        if (id != 0 && std::ranges::find(staged, id) == staged.end()) {
-            UnregisterHotKey(owner_, id);
-        }
-    }
-    bindings_ = requested;
-    ids_ = staged;
-    return S_OK;
+void Hotkeys::Pause() noexcept {
+    if (activeId_) UnregisterHotKey(owner_, std::exchange(activeId_, 0));
 }
 
-std::optional<CaptureMode> Hotkeys::Match(WPARAM id, LPARAM keyData) const noexcept {
-    const Hotkey received{LOWORD(keyData) & kModifierMask, HIWORD(keyData)};
-    for (std::size_t index = 0; index < ids_.size(); ++index) {
-        // 同时核对组合，丢弃设置切换前已进入队列、编号恰好被复用的消息。
-        if (ids_[index] != 0 && static_cast<WPARAM>(ids_[index]) == id && received == bindings_[index]) {
-            return static_cast<CaptureMode>(index);
-        }
+ShortcutResult Hotkeys::Resume() noexcept {
+    return activeId_ ? ShortcutResult{} : Register(bindings_[0], activeId_);
+}
+
+ShortcutResult Hotkeys::Register(Hotkey binding, int& id) noexcept {
+    id = 0;
+    if (!binding.key) return {};
+    if (!owner_) return {ShortcutError::Registration};
+    if (binding.key == VK_F12) return {ShortcutError::Reserved};
+    if (nextId_ > 0xbfff) nextId_ = 1;
+    if (nextId_ == activeId_) ++nextId_;
+    if (nextId_ > 0xbfff) nextId_ = 1;
+    const int candidate = nextId_++;
+    SetLastError(ERROR_SUCCESS);
+    if (!RegisterHotKey(owner_, candidate, binding.modifiers | MOD_NOREPEAT, binding.key)) {
+        return {GetLastError() == ERROR_HOTKEY_ALREADY_REGISTERED ? ShortcutError::Occupied : ShortcutError::Registration};
     }
-    return std::nullopt;
+    id = candidate;
+    return {};
+}
+
+ShortcutResult Hotkeys::Apply(const ShortcutBindings& requested) noexcept {
+    const auto valid = ValidateBindings(requested);
+    if (valid.error != ShortcutError::None) return valid;
+    int staged = activeId_;
+    if (!staged || requested[0] != bindings_[0]) {
+        const auto result = Register(requested[0], staged);
+        if (result.error != ShortcutError::None) return result;
+    }
+    if (!SaveBindings(requested)) {
+        if (staged && staged != activeId_) UnregisterHotKey(owner_, staged);
+        return {ShortcutError::Storage};
+    }
+    if (activeId_ != staged) Pause();
+    activeId_ = staged;
+    bindings_ = requested;
+    return {};
+}
+
+bool Hotkeys::Match(WPARAM id, LPARAM keyData) const noexcept {
+    const Hotkey received{LOWORD(keyData) & kShortcutModifiers, HIWORD(keyData)};
+    return activeId_ && id == static_cast<WPARAM>(activeId_) && received == bindings_[0];
 }
 
 }  // namespace picolet

@@ -11,7 +11,8 @@ HRESULT CopyImageToClipboard(HWND owner, const Image& image) noexcept;
 // 必须在已初始化 COM 的线程调用。
 HRESULT SavePngFile(const wchar_t* path, const Image& image, bool replaceExisting) noexcept;
 
-// 以系统对话框选择 PNG 保存路径。S_FALSE 表示取消，失败时可保留当前预览重试。
+// 以系统对话框选择 PNG 保存路径。owner 在对话框关闭前必须有效。
+// S_FALSE 表示用户取消，失败时调用方可保留当前会话的选区和标注以便重试。
 HRESULT SavePngWithDialog(HWND owner, const Image& image) noexcept;
 
 }  // namespace picolet

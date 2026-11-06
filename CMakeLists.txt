@@ -11,17 +11,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
-add_library(picolet_core STATIC src/image.cpp src/export.cpp)
+add_library(picolet_core STATIC src/image.cpp src/capture_edit.cpp src/export.cpp src/hotkeys.cpp)
 target_include_directories(picolet_core PUBLIC src)
 target_compile_definitions(picolet_core PUBLIC UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN
     WINVER=0x0A00 _WIN32_WINNT=0x0A00)
-target_link_libraries(picolet_core PUBLIC gdi32 user32 ole32 shell32 uuid windowscodecs)
+target_link_libraries(picolet_core PUBLIC gdi32 user32 ole32 shell32 uuid windowscodecs advapi32)
 
 add_executable(Picolet WIN32
-    src/app.cpp src/hotkeys.cpp src/overlay.cpp src/preview.cpp src/picolet.rc)
+    src/app.cpp src/overlay.cpp src/pins.cpp src/shortcut_dialog.cpp src/picolet.rc)
 set_property(SOURCE src/picolet.rc APPEND PROPERTY OBJECT_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/picolet.manifest;${CMAKE_CURRENT_SOURCE_DIR}/src/picolet.ico")
-target_link_libraries(Picolet PRIVATE picolet_core advapi32 comctl32 dwmapi)
+target_link_libraries(Picolet PRIVATE picolet_core comctl32 dwmapi shcore)
 
 include(CTest)
 set(picolet_targets picolet_core Picolet)
