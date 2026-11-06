@@ -1,0 +1,9 @@
+# 默认识别文本文件，统一使用 LF，避免因本机换行设置产生整文件差异。
+* text=auto eol=lf
+
+# Windows 批处理脚本保留 CRLF。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 图标是二进制资源，按原始字节保留。
+*.ico binary !eol
