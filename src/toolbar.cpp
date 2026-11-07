@@ -305,9 +305,9 @@ bool CaptureToolbar::Create(HWND parent, HINSTANCE instance, const ShortcutBindi
         if (!controls_[i]) return false;
         if (slider) {
             SendMessageW(controls_[i], TBM_SETLINESIZE, 0, 1);
-        } else if (!SetWindowSubclass(controls_[i], ButtonProc, 1, reinterpret_cast<DWORD_PTR>(this))) {
-            return false;
         }
+        // 两类控件都完整自绘，统一抑制提前擦背景；滑块仍保留系统键盘及拖动行为。
+        if (!SetWindowSubclass(controls_[i], ButtonProc, 1, reinterpret_cast<DWORD_PTR>(this))) return false;
         wchar_t key[96]{};
         if (spec.shortcut != Shortcut::Count) {
             const auto binding = shortcuts[ShortcutIndex(spec.shortcut)];
@@ -344,6 +344,10 @@ void CaptureToolbar::Close() noexcept {
     dimensionFont_.reset();
     main_ = options_ = palette_ = dimension_ = status_ = sizeLabel_ = valueLabel_ = {};
     separators_.fill({});
+    controlBounds_.fill({});
+    layoutValid_ = false;
+    dimensionWidth_ = 0;
+    controlPaintBuffer_.Reset();
 }
 
 void CaptureToolbar::InvalidateSurfaces() const noexcept {
@@ -353,6 +357,7 @@ void CaptureToolbar::InvalidateSurfaces() const noexcept {
 }
 
 void CaptureToolbar::Hide() noexcept {
+    layoutValid_ = false;
     InvalidateSurfaces();
     SendMessageW(tooltip_, TTM_POP, 0, 0);
     for (const auto control : controls_) ShowWindow(control, SW_HIDE);
@@ -368,26 +373,31 @@ bool CaptureToolbar::OverlapsBars(const RECT& rect) const noexcept {
 }
 
 void CaptureToolbar::LayoutDimension(const ToolbarArea& screen, const RECT& selection) noexcept {
-    if (!IsRectEmpty(&dimension_)) InvalidateRect(parent_, &dimension_, FALSE);
-    dimension_ = {};
-    if (IsRectEmpty(&selection) || IsRectEmpty(&screen.bounds)) return;
     const UINT dpi = screen.dpi;
-    if (dimensionDpi_ != dpi || !dimensionFont_) {
-        dimensionDpi_ = dpi;
-        dimensionFont_.reset(CreateUiFont(dpi));
+    RECT next{};
+    wchar_t text[128]{};
+    const bool fontChanged = dimensionDpi_ != dpi || !dimensionFont_;
+    if (!IsRectEmpty(&selection) && !IsRectEmpty(&screen.bounds)) {
+        if (fontChanged) dimensionFont_.reset(CreateUiFont(dpi));
+        std::swprintf(text, std::size(text), L"%ld × %ld 像素",
+                      selection.right - selection.left, selection.bottom - selection.top);
+        if (fontChanged || !dimensionWidth_ || lstrcmpW(text, dimensionText_))
+            dimensionWidth_ = TextWidth(parent_, dimensionFont_.get(), text) + Dip(16, dpi);
+        const LONG height = Dip(24, dpi), gap = Dip(6, dpi);
+        const LONG above = selection.top - gap - height;
+        next = Place(screen.bounds, selection.left, above, dimensionWidth_, height);
+        if (above < screen.bounds.top || OverlapsBars(next)) {
+            const LONG inset = std::min(gap, selection.bottom - selection.top - 1);
+            next = Place(screen.bounds, selection.left, selection.top + inset, dimensionWidth_, height);
+        }
     }
-    std::swprintf(dimensionText_, std::size(dimensionText_), L"%ld × %ld 像素",
-                  selection.right - selection.left, selection.bottom - selection.top);
-    const LONG width = TextWidth(parent_, dimensionFont_.get(), dimensionText_) + Dip(16, dpi);
-    const LONG height = Dip(24, dpi);
-    const LONG gap = Dip(6, dpi);
-    const LONG above = selection.top - gap - height;
-    dimension_ = Place(screen.bounds, selection.left, above, width, height);
-    if (above < screen.bounds.top || OverlapsBars(dimension_)) {
-        const LONG inset = std::min(gap, selection.bottom - selection.top - 1);
-        dimension_ = Place(screen.bounds, selection.left, selection.top + inset, width, height);
-    }
-    InvalidateRect(parent_, &dimension_, FALSE);
+    if (EqualRect(&dimension_, &next) && !lstrcmpW(text, dimensionText_) && !fontChanged) return;
+    if (!IsRectEmpty(&dimension_)) InvalidateRect(parent_, &dimension_, FALSE);
+    dimension_ = next;
+    dimensionDpi_ = dpi;
+    lstrcpynW(dimensionText_, text, static_cast<int>(std::size(dimensionText_)));
+    if (!IsRectEmpty(&dimension_)) InvalidateRect(parent_, &dimension_, FALSE);
+    layoutValid_ = false;
 }
 
 void CaptureToolbar::Layout(const ToolbarArea& workArea, const ToolbarArea& labelScreen, const RECT& selection,
@@ -396,6 +406,21 @@ void CaptureToolbar::Layout(const ToolbarArea& workArea, const ToolbarArea& labe
         Hide();
         return;
     }
+    const auto sameView = [](const ToolbarView& a, const ToolbarView& b) {
+        return a.tool == b.tool && a.style.width == b.style.width && a.style.textSize == b.style.textSize &&
+            a.style.color == b.style.color && a.style.filled == b.style.filled && a.canUndo == b.canUndo &&
+            a.canRedo == b.canRedo && a.paletteOpen == b.paletteOpen && a.document == b.document &&
+            a.imageSize.cx == b.imageSize.cx && a.imageSize.cy == b.imageSize.cy;
+    };
+    wchar_t nextStatus[128]{};
+    lstrcpynW(nextStatus, status ? status : L"", static_cast<int>(std::size(nextStatus)));
+    if (layoutValid_ && sameView(view_, view) && EqualRect(&lastWork_.bounds, &workArea.bounds) &&
+        lastWork_.dpi == workArea.dpi && EqualRect(&lastLabelScreen_.bounds, &labelScreen.bounds) &&
+        lastLabelScreen_.dpi == labelScreen.dpi && EqualRect(&lastSelection_, &selection) &&
+        !lstrcmpW(nextStatus, statusText_)) return;
+    const bool viewChanged = !layoutValid_ || !sameView(view_, view) || dpi_ != workArea.dpi;
+    const bool documentChanged = !layoutValid_ || view_.document != view.document;
+    const bool textToolChanged = !layoutValid_ || (view_.tool == EditTool::Text) != (view.tool == EditTool::Text);
     InvalidateSurfaces();
     SendMessageW(tooltip_, TTM_POP, 0, 0);
     const UINT dpi = workArea.dpi;
@@ -518,12 +543,14 @@ void CaptureToolbar::Layout(const ToolbarArea& workArea, const ToolbarArea& labe
         return tag;
     };
     if (selected) {
-        LayoutDimension(labelScreen, selection);
         if (view.document) {
+            if (!dimensionFont_ || dimensionDpi_ != labelScreen.dpi) dimensionFont_.reset(CreateUiFont(labelScreen.dpi));
+            dimensionDpi_ = labelScreen.dpi;
+            dimensionWidth_ = 0;
             std::swprintf(dimensionText_, std::size(dimensionText_), L"%ld × %ld 像素", view.imageSize.cx, view.imageSize.cy);
             dimension_ = {work.left + gap, blockTop + blockHeight + gap,
                           work.left + Dip(230, dpi), blockTop + blockHeight + gap + tagHeight};
-        }
+        } else LayoutDimension(labelScreen, selection);
     } else {
         dimensionFont_.reset();
         dimensionDpi_ = dpi;
@@ -539,37 +566,47 @@ void CaptureToolbar::Layout(const ToolbarArea& workArea, const ToolbarArea& labe
             status_ = placeTag(width, dimension_.left, dimension_.bottom + gap);
     }
 
-    EnableWindow(controls_[Index(Button::Undo)], view.canUndo);
-    SetWindowTextW(controls_[Index(Button::Select)], view.document ? L"移动视图" : L"调整选区");
+    if (bool(IsWindowEnabled(controls_[Index(Button::Undo)])) != view.canUndo) EnableWindow(controls_[Index(Button::Undo)], view.canUndo);
+    if (documentChanged) SetWindowTextW(controls_[Index(Button::Select)], view.document ? L"移动视图" : L"调整选区");
     lstrcpynW(tooltipText_[Index(Button::Select)].data(), view.document ? L"移动视图" : L"调整选区", 128);
-    EnableWindow(controls_[Index(Button::Redo)], view.canRedo);
+    if (bool(IsWindowEnabled(controls_[Index(Button::Redo)])) != view.canRedo) EnableWindow(controls_[Index(Button::Redo)], view.canRedo);
     if (hasSize) {
         const bool text = view.tool == EditTool::Text;
         const HWND slider = controls_[Index(Button::Size)];
         value_ = text ? view.style.textSize : view.style.width;
-        SetWindowTextW(slider, text ? L"字号" : L"粗细");
+        if (textToolChanged) SetWindowTextW(slider, text ? L"字号" : L"粗细");
         const int minimum = text ? ToolbarStyle::kMinTextSize : ToolbarStyle::kMinWidth;
         const int maximum = text ? ToolbarStyle::kMaxTextSize : ToolbarStyle::kMaxWidth;
-        SendMessageW(slider, TBM_SETRANGE, FALSE, MAKELPARAM(minimum, maximum));
-        SendMessageW(slider, TBM_SETPOS, TRUE, value_);
+        if (SendMessageW(slider, TBM_GETRANGEMIN, 0, 0) != minimum || SendMessageW(slider, TBM_GETRANGEMAX, 0, 0) != maximum)
+            SendMessageW(slider, TBM_SETRANGE, FALSE, MAKELPARAM(minimum, maximum));
+        if (SendMessageW(slider, TBM_GETPOS, 0, 0) != value_) SendMessageW(slider, TBM_SETPOS, TRUE, value_);
     }
     for (std::size_t i = 0; i < controls_.size(); ++i) {
         RECT box = boxes[i];
         if (IsRectEmpty(&box)) {
-            ShowWindow(controls_[i], SW_HIDE);
+            if (GetWindowLongPtrW(controls_[i], GWL_STYLE) & WS_VISIBLE) ShowWindow(controls_[i], SW_HIDE);
+            controlBounds_[i] = {};
             continue;
         }
         const auto& area = i < Index(Button::Rectangle) ? main_ : i < Index(Button::Red) ? options_ : palette_;
         OffsetRect(&box, area.left + pad, area.top + pad);
         if (!IntersectRect(&box, &box, &area)) {
-            ShowWindow(controls_[i], SW_HIDE);
+            if (GetWindowLongPtrW(controls_[i], GWL_STYLE) & WS_VISIBLE) ShowWindow(controls_[i], SW_HIDE);
+            controlBounds_[i] = {};
             continue;
         }
-        SetWindowPos(controls_[i], nullptr, box.left, box.top, box.right - box.left, box.bottom - box.top,
-                     SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
-        InvalidateRect(controls_[i], nullptr, FALSE);
+        const bool moved = !EqualRect(&controlBounds_[i], &box);
+        const bool shown = (GetWindowLongPtrW(controls_[i], GWL_STYLE) & WS_VISIBLE) != 0;
+        if (moved || !shown) SetWindowPos(controls_[i], nullptr, box.left, box.top, box.right - box.left, box.bottom - box.top,
+                                        SWP_NOACTIVATE | SWP_NOZORDER | SWP_SHOWWINDOW);
+        controlBounds_[i] = box;
+        if (moved || !shown || viewChanged) InvalidateRect(controls_[i], nullptr, FALSE);
     }
     InvalidateSurfaces();
+    lastWork_ = workArea;
+    lastLabelScreen_ = labelScreen;
+    lastSelection_ = selection;
+    layoutValid_ = true;
 }
 
 int CaptureToolbar::Bottom() const noexcept {
@@ -603,13 +640,17 @@ int CaptureToolbar::SliderValue() const noexcept {
 }
 
 void CaptureToolbar::SetValue(int value) noexcept {
+    if (value_ == value) return;
     value_ = value;
+    if (view_.tool == EditTool::Text) view_.style.textSize = value;
+    else view_.style.width = value;
     if (!IsRectEmpty(&valueLabel_)) InvalidateRect(parent_, &valueLabel_, FALSE);
 }
 
 LRESULT CALLBACK CaptureToolbar::ButtonProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
                                            UINT_PTR id, DWORD_PTR data) noexcept {
     auto& self = *reinterpret_cast<CaptureToolbar*>(data);
+    if (message == WM_ERASEBKGND) return 1;
     if (message == WM_MOUSEMOVE && self.hovered_ != window) {
         const HWND previous = std::exchange(self.hovered_, window);
         if (previous) InvalidateRect(previous, nullptr, FALSE);
@@ -671,9 +712,11 @@ bool CaptureToolbar::DrawButton(const DRAWITEMSTRUCT& item) const noexcept {
     const bool hovered = enabled && item.hwndItem == hovered_;
     const COLORREF ink = !enabled ? RGB(163, 167, 175) : button == Button::Copy ? kGreen :
                          button == Button::Cancel ? kRed : kInk;
-    FillRect(item.hDC, &item.rcItem, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+    BufferedPaint drawing(controlPaintBuffer_, item.hDC, item.rcItem);
+    const auto dc = drawing.dc();
+    FillRect(dc, &item.rcItem, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
     {
-        Graphics graphics(item.hDC);
+        Graphics graphics(dc);
         Smooth(graphics);
         if (active || pressed || hovered) {
             auto background = Box(item.rcItem);
@@ -694,7 +737,7 @@ bool CaptureToolbar::DrawButton(const DRAWITEMSTRUCT& item) const noexcept {
     if (item.itemState & ODS_FOCUS) {
         RECT focus = item.rcItem;
         InflateRect(&focus, -Dip(2, dpi_), -Dip(2, dpi_));
-        DrawFocusRect(item.hDC, &focus);
+        DrawFocusRect(dc, &focus);
     }
     return true;
 }
@@ -707,9 +750,11 @@ std::optional<LRESULT> CaptureToolbar::DrawSlider(const NMHDR& item) const noexc
     GetClientRect(item.hwndFrom, &client);
     SendMessageW(item.hwndFrom, TBM_GETCHANNELRECT, 0, reinterpret_cast<LPARAM>(&channel));
     SendMessageW(item.hwndFrom, TBM_GETTHUMBRECT, 0, reinterpret_cast<LPARAM>(&thumb));
-    FillRect(draw.hdc, &client, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+    BufferedPaint drawing(controlPaintBuffer_, draw.hdc, client);
+    const auto dc = drawing.dc();
+    FillRect(dc, &client, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
     {
-        Graphics graphics(draw.hdc);
+        Graphics graphics(dc);
         Smooth(graphics);
         const auto track = Box(channel);
         const auto grip = Box(thumb);
@@ -724,7 +769,7 @@ std::optional<LRESULT> CaptureToolbar::DrawSlider(const NMHDR& item) const noexc
     }
     if (GetFocus() == item.hwndFrom) {
         InflateRect(&client, -1, -1);
-        DrawFocusRect(draw.hdc, &client);
+        DrawFocusRect(dc, &client);
     }
     return CDRF_SKIPDEFAULT;
 }

@@ -148,6 +148,7 @@ void LongCaptureSession::Close() noexcept {
     directionDown_ = directionUp_ = autoButton_ = finishButton_ = cancelButton_ = nullptr;
     font_.reset();
     snapshot_ = {};
+    paintBuffer_.Reset();
 }
 
 HRESULT LongCaptureSession::Finish(Image& image, SeedPlacement& placement) const noexcept {
@@ -320,8 +321,9 @@ void LongCaptureSession::ToggleAutomatic() noexcept {
 }
 
 void LongCaptureSession::Pause(const wchar_t* status) noexcept {
+    const bool wasAutomatic = automatic_;
     automatic_ = pendingAuto_ = false;
-    if (autoButton_) SetWindowTextW(autoButton_, L"自动滚动");
+    if (autoButton_ && wasAutomatic) SetWindowTextW(autoButton_, L"自动滚动");
     Status(status);
 }
 
@@ -332,9 +334,7 @@ void LongCaptureSession::Tick() noexcept {
     const auto oldMotion = snapshot_.stats.motion;
     const auto oldTracking = snapshot_.tracking;
     const auto oldStitch = snapshot_.stitchStatus;
-    const bool repaint = fresh.revision != snapshot_.revision;
-    snapshot_ = fresh;
-    if (repaint) InvalidateRect(panel_, nullptr, FALSE);
+    UpdateSnapshot(fresh);
     if (finishing_) {
         if (snapshot_.finished) PublishAction(ScrollAction::Finish);
         return;
@@ -413,8 +413,11 @@ void LongCaptureSession::PublishAction(ScrollAction action) noexcept {
 }
 
 void LongCaptureSession::Status(const wchar_t* text) noexcept {
-    if (text != status_) lstrcpynW(status_, text ? text : L"", static_cast<int>(std::size(status_)));
-    if (panel_) InvalidateRect(panel_, nullptr, FALSE);
+    wchar_t next[180]{};
+    lstrcpynW(next, text ? text : L"", static_cast<int>(std::size(next)));
+    if (!lstrcmpW(next, status_)) return;
+    lstrcpynW(status_, next, static_cast<int>(std::size(status_)));
+    if (panel_) { const auto area = StatusRect(); InvalidateRect(panel_, &area, FALSE); }
 }
 
 void LongCaptureSession::Layout() noexcept {
@@ -432,15 +435,62 @@ void LongCaptureSession::Layout() noexcept {
     place(directionDown_, gap, bottom - height * 3 - gap * 2, half);
     place(directionUp_, gap * 2 + half, bottom - height * 3 - gap * 2, half);
     previewRect_ = {gap, Dip(58, dpi_), client.right - gap, bottom - height * 3 - gap * 3 - Dip(62, dpi_)};
+    InvalidateRect(panel_, nullptr, FALSE);
 }
 
 void LongCaptureSession::UpdatePreview() noexcept {
-    snapshot_ = pipeline_.Snapshot();
-    InvalidateRect(panel_, nullptr, FALSE);
+    UpdateSnapshot(pipeline_.Snapshot());
+}
+
+RECT LongCaptureSession::DimensionRect() const noexcept {
+    RECT client{}; GetClientRect(panel_, &client);
+    return {Dip(12, dpi_), Dip(32, dpi_), client.right - Dip(12, dpi_), Dip(52, dpi_)};
+}
+
+RECT LongCaptureSession::StatusRect() const noexcept {
+    RECT client{}; GetClientRect(panel_, &client);
+    return {Dip(12, dpi_), previewRect_.bottom + Dip(7, dpi_), client.right - Dip(12, dpi_), previewRect_.bottom + Dip(63, dpi_)};
+}
+
+RECT LongCaptureSession::PreviewPosition(const CapturePipelineSnapshot& snapshot) const noexcept {
+    if (!snapshot.preview || snapshot.preview->empty() || snapshot.height <= 0 || IsRectEmpty(&previewRect_)) return {};
+    const RECT fitted = FitImage(*snapshot.preview, previewRect_);
+    const auto view = snapshot.viewport;
+    RECT position{fitted.left, fitted.top + MulDiv(view.top, fitted.bottom - fitted.top, snapshot.height),
+                  fitted.right, fitted.top + MulDiv(view.bottom, fitted.bottom - fitted.top, snapshot.height)};
+    position.bottom = std::min(fitted.bottom, std::max(position.top + 2, position.bottom));
+    return position;
+}
+
+void LongCaptureSession::UpdateSnapshot(const CapturePipelineSnapshot& next) noexcept {
+    if (panel_) {
+        if (next.width != snapshot_.width || next.height != snapshot_.height) {
+            const auto label = DimensionRect();
+            InvalidateRect(panel_, &label, FALSE);
+        }
+        if (next.preview != snapshot_.preview) {
+            InvalidateRect(panel_, &previewRect_, FALSE);
+        } else {
+            const auto previous = PreviewPosition(snapshot_), current = PreviewPosition(next);
+            if (!EqualRect(&previous, &current)) {
+                if (!IsRectEmpty(&previous)) InvalidateRect(panel_, &previous, FALSE);
+                if (!IsRectEmpty(&current)) InvalidateRect(panel_, &current, FALSE);
+            }
+        }
+    }
+    snapshot_ = next;
 }
 void LongCaptureSession::Paint() noexcept {
     PAINTSTRUCT paint{};
-    const auto dc = BeginPaint(panel_, &paint);
+    const auto target = BeginPaint(panel_, &paint);
+    if (target) {
+        BufferedPaint drawing(paintBuffer_, target, paint.rcPaint);
+        PaintContents(drawing.dc());
+    }
+    EndPaint(panel_, &paint);
+}
+
+void LongCaptureSession::PaintContents(HDC dc) const noexcept {
     RECT client{};
     GetClientRect(panel_, &client);
     Fill(dc, client, RGB(255, 255, 255));
@@ -451,24 +501,20 @@ void LongCaptureSession::Paint() noexcept {
     DrawTextW(dc, L"长截图", -1, &title, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
     wchar_t dimension[80]{};
     std::swprintf(dimension, std::size(dimension), L"%d × %d 像素", snapshot_.width, snapshot_.height);
-    RECT label{title.left, Dip(32, dpi_), title.right, Dip(52, dpi_)};
+    RECT label = DimensionRect();
     SetTextColor(dc, RGB(95, 101, 112));
     DrawTextW(dc, dimension, -1, &label, DT_LEFT | DT_SINGLELINE | DT_VCENTER);
     Fill(dc, previewRect_, RGB(240, 242, 245));
     if (snapshot_.preview && !snapshot_.preview->empty() && snapshot_.height > 0) {
         const RECT fitted = FitImage(*snapshot_.preview, previewRect_);
         DrawImage(dc, *snapshot_.preview, fitted);
-        const auto viewport = snapshot_.viewport;
-        RECT position{fitted.left, fitted.top + MulDiv(viewport.top, fitted.bottom - fitted.top, snapshot_.height),
-                      fitted.right, fitted.top + MulDiv(viewport.bottom, fitted.bottom - fitted.top, snapshot_.height)};
-        position.bottom = std::max(position.top + 2, position.bottom);
+        const auto position = PreviewPosition(snapshot_);
         SetDCBrushColor(dc, RGB(0, 139, 110));
         FrameRect(dc, &position, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
     }
-    RECT status{title.left, previewRect_.bottom + Dip(7, dpi_), title.right, previewRect_.bottom + Dip(63, dpi_)};
+    RECT status = StatusRect();
     DrawTextW(dc, status_, -1, &status, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
     if (old) SelectObject(dc, old);
-    EndPaint(panel_, &paint);
 }
 
 }  // namespace picolet

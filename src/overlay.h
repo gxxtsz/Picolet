@@ -5,6 +5,7 @@
 #include "toolbar.h"
 #include "win32.h"
 #include "image_view.h"
+#include "paint_buffer.h"
 
 namespace picolet {
 
@@ -53,6 +54,8 @@ public:
     const RECT& selection() const noexcept { return selection_; }
 
 private:
+    // 仅仓库内的绘制回归测试读取窗口脏区域和缓存状态，不向应用调用方增加接口。
+    friend struct PaintTestAccess;
     enum class Drag { None, Create, Move, Resize, Mark, Pan };
 
     static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) noexcept;
@@ -86,7 +89,8 @@ private:
     ToolbarArea DimensionScreen() const noexcept;
     void LayoutPanel() noexcept;
     void Status(const wchar_t* text) noexcept;
-    void RepaintSelection(const RECT& previous) noexcept;
+    // contentChanged 只在已提交的像素变化时为 true；草稿或工具切换不重建长图缩略图。
+    void RepaintSelection(const RECT& previous, bool contentChanged = true) noexcept;
 
     // 马赛克草稿只影响原选区内的矩形。每次改变终点前后各标记一次，旧预览由底图重绘清除。
     RECT MosaicDraftArea() const noexcept;
@@ -94,6 +98,8 @@ private:
     // 在已裁到选区的 DC 上叠绘草稿，马赛克只在草稿区域需要重绘时计算像素。
     void PaintDraft(HDC dc) const noexcept;
     void Paint() noexcept;
+    // 在指定 DC 上绘制普通截图；底图、标注及标签由外层统一缓冲后提交。
+    void PaintSelection(HDC dc) const noexcept;
 
     // 长图编辑专用布局、可见行绘制、缩放和 32 位滚动条同步；普通截图仍使用原有桌面坐标。
     void LayoutEditor() noexcept;
@@ -103,10 +109,18 @@ private:
     void ScrollEditor(int bar, UINT command) noexcept;
     bool ChangeView() noexcept;
     POINT ClientCursor() const noexcept;
+    // before 为本次视图操作前的快照；仅刷新画布、定位框新旧范围及变化的缩放文字。
+    // 此方法同步滚动条，但不重排工具栏、不重建缩略图；位置无变化时不触发刷新。
+    void RefreshEditorView(const ImageViewport& before) noexcept;
+    // 将原图可见范围映射为缩略图客户区定位框；空缩略图返回空矩形。
+    RECT OverviewPosition(const ImageViewport& view) const noexcept;
+    // 缩放文字在客户区中的物理像素范围，绘制及局部刷新使用同一矩形。
+    RECT ZoomLabel() const noexcept;
 
     HWND window_ = nullptr;
     HWND owner_ = nullptr;
     HWND textEdit_ = nullptr;
+    PaintBuffer paintBuffer_;
     CaptureToolbar toolbar_;
     const DesktopFrame* frame_ = nullptr;
     ShortcutBindings shortcuts_{};

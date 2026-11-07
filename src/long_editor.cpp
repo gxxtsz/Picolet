@@ -11,6 +11,17 @@ void FillEditor(HDC dc, const RECT& rect, COLORREF color) noexcept {
     SetDCBrushColor(dc, color);
     FillRect(dc, &rect, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
 }
+
+// bounds 使用父窗口客户区物理坐标；工具状态变化不一定改变布局，实际几何不变时不移动控件。
+void PlaceEditorControl(HWND control, RECT bounds) noexcept {
+    RECT previous{};
+    if (GetWindowRect(control, &previous)) {
+        MapWindowPoints(nullptr, GetParent(control), reinterpret_cast<POINT*>(&previous), 2);
+        if (EqualRect(&previous, &bounds)) return;
+    }
+    SetWindowPos(control, nullptr, bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+}
 }
 
 HRESULT SelectionOverlay::OpenEditor(HINSTANCE instance, HWND owner, const DesktopFrame& frame, RECT anchor,
@@ -70,6 +81,8 @@ bool SelectionOverlay::ChangeView() noexcept {
 
 void SelectionOverlay::LayoutEditor() noexcept {
     if (!window_ || !frame_ || !fitButton_ || closing_ || busy_) return;
+    const auto oldCanvas = viewport_.canvas;
+    const auto oldOverview = overview_;
     RECT client{};
     GetClientRect(window_, &client);
     const int sidebar = Dip(164, dpi_), gap = Dip(10, dpi_);
@@ -88,11 +101,12 @@ void SelectionOverlay::LayoutEditor() noexcept {
     if (viewport_.canvas.bottom <= viewport_.canvas.top) viewport_.canvas.bottom = viewport_.canvas.top + 1;
     viewport_.Clamp();
     const int sideX = client.right - sidebar + gap;
-    SetWindowPos(fitButton_, nullptr, sideX, gap, sidebar - gap * 2, Dip(28, dpi_), SWP_NOZORDER | SWP_NOACTIVATE);
-    SetWindowPos(actualButton_, nullptr, sideX, gap + Dip(36, dpi_), sidebar - gap * 2, Dip(28, dpi_), SWP_NOZORDER | SWP_NOACTIVATE);
+    PlaceEditorControl(fitButton_, {sideX, gap, client.right - gap, gap + Dip(28, dpi_)});
+    PlaceEditorControl(actualButton_, {sideX, gap + Dip(36, dpi_), client.right - gap, gap + Dip(64, dpi_)});
     const RECT space{sideX, gap + Dip(100, dpi_), client.right - gap, client.bottom - gap};
     overview_ = FitImage(frame_->image, space);
-    overviewImage_ = {};
+    if (overview_.right - overview_.left != oldOverview.right - oldOverview.left ||
+        overview_.bottom - overview_.top != oldOverview.bottom - oldOverview.top) overviewImage_ = {};
     if (textEdit_) {
         RECT box = viewport_.ToClient({draft_.first.x, draft_.first.y, draft_.clip.right, draft_.first.y + 100});
         box.right = std::min(box.right, viewport_.canvas.right);
@@ -101,6 +115,8 @@ void SelectionOverlay::LayoutEditor() noexcept {
                      std::max(1L, box.bottom - box.top), SWP_NOZORDER | SWP_NOACTIVATE);
     }
     UpdateScrollbars();
+    if (!EqualRect(&oldCanvas, &viewport_.canvas) || !EqualRect(&oldOverview, &overview_))
+        InvalidateRect(window_, nullptr, FALSE);
 }
 
 void SelectionOverlay::UpdateScrollbars() noexcept {
@@ -113,12 +129,17 @@ void SelectionOverlay::UpdateScrollbars() noexcept {
         info.nMax = std::max(0, static_cast<int>(std::ceil((vertical ? viewport_.image.cy : viewport_.image.cx) * viewport_.zoom)) - 1);
         info.nPage = static_cast<UINT>(std::max(1L, vertical ? viewport_.canvas.bottom - viewport_.canvas.top : viewport_.canvas.right - viewport_.canvas.left));
         info.nPos = static_cast<int>(vertical ? viewport_.scrollY : viewport_.scrollX);
-        SetScrollInfo(window_, bar, &info, TRUE);
+        SCROLLINFO previous{};
+        previous.cbSize = sizeof(previous);
+        previous.fMask = SIF_RANGE | SIF_PAGE | SIF_POS;
+        if (!GetScrollInfo(window_, bar, &previous) || previous.nMin != info.nMin || previous.nMax != info.nMax ||
+            previous.nPage != info.nPage || previous.nPos != info.nPos) SetScrollInfo(window_, bar, &info, TRUE);
     }
 }
 
 void SelectionOverlay::ScrollEditor(int bar, UINT command) noexcept {
     if (busy_ || pending_ || drag_ != Drag::None || !ChangeView()) return;
+    const auto before = viewport_;
     SCROLLINFO info{};
     info.cbSize = sizeof(info);
     info.fMask = SIF_ALL;
@@ -135,8 +156,41 @@ void SelectionOverlay::ScrollEditor(int bar, UINT command) noexcept {
     default: return;
     }
     viewport_.Clamp();
+    RefreshEditorView(before);
+}
+
+RECT SelectionOverlay::OverviewPosition(const ImageViewport& view) const noexcept {
+    if (IsRectEmpty(&overview_) || !view.image.cx || !view.image.cy) return {};
+    const RECT visible = view.Visible();
+    const LONG width = overview_.right - overview_.left, height = overview_.bottom - overview_.top;
+    RECT box{overview_.left + MulDiv(visible.left, width, view.image.cx),
+             overview_.top + MulDiv(visible.top, height, view.image.cy),
+             overview_.left + MulDiv(visible.right, width, view.image.cx),
+             overview_.top + MulDiv(visible.bottom, height, view.image.cy)};
+    box.bottom = std::min(overview_.bottom, std::max(box.top + 2, box.bottom));
+    return box;
+}
+
+RECT SelectionOverlay::ZoomLabel() const noexcept {
+    RECT client{};
+    GetClientRect(window_, &client);
+    return {client.right - Dip(154, dpi_), Dip(80, dpi_), client.right - Dip(10, dpi_), Dip(100, dpi_)};
+}
+
+void SelectionOverlay::RefreshEditorView(const ImageViewport& before) noexcept {
+    if (before.scrollX == viewport_.scrollX && before.scrollY == viewport_.scrollY && before.zoom == viewport_.zoom) return;
     UpdateScrollbars();
-    InvalidateRect(window_, nullptr, FALSE);
+    InvalidateRect(window_, &viewport_.canvas, FALSE);
+    const auto previous = OverviewPosition(before), current = OverviewPosition(viewport_);
+    // 分别提交新旧矩形，保留不相交区域的系统裁剪，不把两者之间的静态区域也标记为脏。
+    if (!EqualRect(&previous, &current)) {
+        if (!IsRectEmpty(&previous)) InvalidateRect(window_, &previous, FALSE);
+        if (!IsRectEmpty(&current)) InvalidateRect(window_, &current, FALSE);
+    }
+    if (before.zoom != viewport_.zoom) {
+        const auto label = ZoomLabel();
+        InvalidateRect(window_, &label, FALSE);
+    }
 }
 
 void SelectionOverlay::DrawDocumentImage(HDC dc, const Image& image, RECT bounds) const noexcept {
@@ -151,16 +205,20 @@ void SelectionOverlay::PaintEditor(HDC dc) noexcept {
     RECT client{};
     GetClientRect(window_, &client);
     FillEditor(dc, client, RGB(240, 242, 245));
-    const int saved = SaveDC(dc);
-    IntersectClipRect(dc, viewport_.canvas.left, viewport_.canvas.top, viewport_.canvas.right, viewport_.canvas.bottom);
-    SetStretchBltMode(dc, HALFTONE);
-    SetBrushOrgEx(dc, 0, 0, nullptr);
-    DrawDocumentImage(dc, frame_->image, frame_->bounds);
     const auto& patch = history_.patch();
-    DrawDocumentImage(dc, patch.image, patch.bounds);
-    if (drag_ == Drag::Mark) PaintDraft(dc);
-    if (saved) RestoreDC(dc, saved);
-    if (!IsRectEmpty(&overview_)) {
+    if (RectVisible(dc, &viewport_.canvas)) {
+        const int saved = SaveDC(dc);
+        if (saved) {
+            IntersectClipRect(dc, viewport_.canvas.left, viewport_.canvas.top, viewport_.canvas.right, viewport_.canvas.bottom);
+            SetStretchBltMode(dc, HALFTONE);
+            SetBrushOrgEx(dc, 0, 0, nullptr);
+            DrawDocumentImage(dc, frame_->image, frame_->bounds);
+            DrawDocumentImage(dc, patch.image, patch.bounds);
+            if (drag_ == Drag::Mark) PaintDraft(dc);
+            RestoreDC(dc, saved);
+        }
+    }
+    if (!IsRectEmpty(&overview_) && RectVisible(dc, &overview_)) {
         if (overviewImage_.empty() && SUCCEEDED(overviewImage_.Resize(overview_.right - overview_.left, overview_.bottom - overview_.top))) {
             for (int y = 0; y < overviewImage_.height(); ++y)
                 for (int x = 0; x < overviewImage_.width(); ++x) {
@@ -173,18 +231,13 @@ void SelectionOverlay::PaintEditor(HDC dc) noexcept {
                 }
         }
         DrawImage(dc, overviewImage_, overview_);
-        const RECT visible = viewport_.Visible();
-        RECT box{overview_.left + MulDiv(visible.left, overview_.right - overview_.left, frame_->image.width()),
-                 overview_.top + MulDiv(visible.top, overview_.bottom - overview_.top, frame_->image.height()),
-                 overview_.left + MulDiv(visible.right, overview_.right - overview_.left, frame_->image.width()),
-                 overview_.top + MulDiv(visible.bottom, overview_.bottom - overview_.top, frame_->image.height())};
-        box.bottom = std::max(box.top + 2, box.bottom);
+        const auto box = OverviewPosition(viewport_);
         SetDCBrushColor(dc, RGB(0, 139, 110));
         FrameRect(dc, &box, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
     }
     wchar_t label[32]{};
     std::swprintf(label, std::size(label), L"缩放 %.0f%%", viewport_.zoom * 100);
-    RECT text{client.right - Dip(154, dpi_), Dip(80, dpi_), client.right - Dip(10, dpi_), Dip(100, dpi_)};
+    RECT text = ZoomLabel();
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, RGB(80, 85, 95));
     const auto oldFont = editorFont_ ? SelectObject(dc, editorFont_.get()) : nullptr;

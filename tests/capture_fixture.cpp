@@ -11,6 +11,15 @@
 #include <cwchar>
 #include <filesystem>
 #include <utility>
+#include <algorithm>
+
+namespace picolet {
+// 仅供本交互夹具观察生产绘制状态，不向应用添加诊断接口或计数开销。
+struct PaintTestAccess {
+    static RECT Toolbar(const SelectionOverlay& overlay) noexcept { return overlay.toolbar_.main_; }
+    static bool Cached(const SelectionOverlay& overlay) noexcept { return !overlay.overviewImage_.empty(); }
+};
+}
 
 using namespace picolet;
 namespace {
@@ -21,12 +30,81 @@ DesktopFrame document;
 HINSTANCE instance;
 RECT anchor{};
 wchar_t status[180] = L"请先打开原生滚动验证页，再点击开始。";
+bool documentMode = true;
+unsigned long long paints = 0, toolbarPaints = 0, thumbnailBuilds = 0;
+
+// 在生产窗口绘制之前读取真实更新区，绘制之后只读检查缓存；不注入输入、不改变绘制时序。
+LRESULT CALLBACK ObservePaint(HWND window, UINT message, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR) {
+    if (message == WM_NCDESTROY) RemoveWindowSubclass(window, ObservePaint, id);
+    if (message != WM_PAINT) return DefSubclassProc(window, message, wp, lp);
+    const auto region = CreateRectRgn(0, 0, 0, 0);
+    const auto toolbar = PaintTestAccess::Toolbar(editor);
+    if (region) {
+        GetUpdateRgn(window, region, FALSE);
+        if (RectInRegion(region, &toolbar)) ++toolbarPaints;
+        DeleteObject(region);
+    }
+    ++paints;
+    const bool cached = PaintTestAccess::Cached(editor);
+    const auto result = DefSubclassProc(window, message, wp, lp);
+    if (!cached && PaintTestAccess::Cached(editor)) ++thumbnailBuilds;
+    return result;
+}
+
+void ObserveEditor() {
+    paints = toolbarPaints = thumbnailBuilds = 0;
+    SetWindowSubclass(editor.window(), ObservePaint, 2, 0);
+}
+
+// 分块生成带段号和色块的 1400×42500 测试长图，避免另建同尺寸 GDI 位图。
+HRESULT PrepareLongDocument() {
+    constexpr int width = 1400, height = 42500, tileHeight = 256;
+    auto hr = document.image.Resize(width, height);
+    if (FAILED(hr)) return hr;
+    Image tile; hr = tile.Resize(width, tileHeight);
+    if (FAILED(hr)) return hr;
+    MemoryDc dc(CreateCompatibleDC(nullptr));
+    void* pixels = nullptr;
+    const auto info = tile.BitmapInfo();
+    BitmapHandle bitmap(CreateDIBSection(dc.get(), &info, DIB_RGB_COLORS, &pixels, nullptr, 0));
+    if (!dc || !bitmap || !pixels) return E_OUTOFMEMORY;
+    const auto oldBitmap = SelectObject(dc.get(), bitmap.get());
+    FontHandle font(CreateAnnotationFont(28));
+    const auto oldFont = font ? SelectObject(dc.get(), font.get()) : nullptr;
+    SetBkMode(dc.get(), TRANSPARENT);
+    for (int top = 0; top < height; top += tileHeight) {
+        const RECT bounds{0, 0, width, tileHeight};
+        FillRect(dc.get(), &bounds, static_cast<HBRUSH>(GetStockObject(WHITE_BRUSH)));
+        SetDCBrushColor(dc.get(), RGB(225 + (top / tileHeight) % 20, 240, 248));
+        RECT card{30, 12, width - 30, 240};
+        FillRect(dc.get(), &card, static_cast<HBRUSH>(GetStockObject(DC_BRUSH)));
+        SetTextColor(dc.get(), RGB(25, 45, 62));
+        wchar_t text[180]{};
+        std::swprintf(text, std::size(text), L"第 %03d 段：长图连续滚动与局部重绘验证，原图行 %d。", top / tileHeight + 1, top);
+        TextOutW(dc.get(), 55, 35, text, static_cast<int>(std::wcslen(text)));
+        constexpr wchar_t detail[] = L"检查：画面无露底，固定工具栏不刷新，缩略图缓存不重建。";
+        TextOutW(dc.get(), 55, 105, detail, static_cast<int>(std::size(detail) - 1));
+        GdiFlush();
+        const auto count = static_cast<std::size_t>(std::min(tileHeight, height - top)) * width;
+        const auto* source = static_cast<const std::uint32_t*>(pixels);
+        std::transform(source, source + count, document.image.pixels().begin() + static_cast<std::size_t>(top) * width,
+                       [](auto pixel) { return pixel | 0xff000000u; });
+    }
+    if (oldFont) SelectObject(dc.get(), oldFont);
+    SelectObject(dc.get(), oldBitmap);
+    document.bounds = {0, 0, width, height};
+    return S_OK;
+}
 
 LRESULT CALLBACK Proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     switch (message) {
     case WM_CREATE:
         CreateWindowExW(0, L"BUTTON", L"开始长截图", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
             18, 18, 200, 38, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(7100)), instance, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"打开测试长图（1400×42500）", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            18, 66, 360, 38, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(7101)), instance, nullptr);
+        CreateWindowExW(0, L"BUTTON", L"普通截图绘制验证", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+            18, 114, 360, 38, window, reinterpret_cast<HMENU>(static_cast<INT_PTR>(7102)), instance, nullptr);
         SetTimer(window, 2, 250, nullptr);
         return 0;
     case WM_TIMER:
@@ -49,13 +127,36 @@ LRESULT CALLBACK Proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
                     if (cursor.hCursor == LoadCursorW(nullptr, entry.first)) { shape = entry.second; break; }
             }
             RECT bounds{}; GetWindowRect(editor.window(), &bounds);
-            wchar_t title[180]{};
-            std::swprintf(title, std::size(title), L"Picolet 长图编辑 · %ls · %ld×%ld · %u DPI",
-                          shape, bounds.right - bounds.left, bounds.bottom - bounds.top, GetDpiForWindow(editor.window()));
-            SetWindowTextW(editor.window(), title);
+            wchar_t title[240]{};
+            std::swprintf(title, std::size(title), L"Picolet %ls · %ls · %ld×%ld · %u DPI · 重绘 %llu / 工具栏 %llu / 缩略图 %llu",
+                          documentMode ? L"长图编辑" : L"截图验证", shape, bounds.right - bounds.left, bounds.bottom - bounds.top,
+                          GetDpiForWindow(editor.window()), paints, toolbarPaints, thumbnailBuilds);
+            wchar_t previous[240]{}; GetWindowTextW(editor.window(), previous, static_cast<int>(std::size(previous)));
+            if (lstrcmpW(previous, title)) SetWindowTextW(editor.window(), title);
         }
         return 0;
     case WM_COMMAND:
+        if (LOWORD(wp) == 7101 || LOWORD(wp) == 7102) {
+            ShowWindow(window, SW_HIDE);
+            documentMode = LOWORD(wp) == 7101;
+            HRESULT hr;
+            if (documentMode) {
+                hr = PrepareLongDocument();
+                anchor = {180, 180, 1580, 1000};
+                if (SUCCEEDED(hr)) hr = editor.OpenEditor(instance, window, document, anchor, DefaultShortcuts(), AnnotationHistory{});
+            } else {
+                DwmFlush();  // 等待测试入口隐藏后再冻结桌面，避免夹具自身残留在测试底图中。
+                hr = CaptureDesktop(document);
+                if (SUCCEEDED(hr)) hr = editor.Open(instance, window, document, {180, 180}, DefaultShortcuts());
+                if (SUCCEEDED(hr)) {
+                    const auto overlay = editor.window();
+                    SetWindowLongPtrW(overlay, GWL_EXSTYLE, (GetWindowLongPtrW(overlay, GWL_EXSTYLE) & ~WS_EX_TOOLWINDOW) | WS_EX_APPWINDOW);
+                }
+            }
+            if (SUCCEEDED(hr)) ObserveEditor();
+            else { document = {}; ShowWindow(window, SW_SHOW); MessageBoxW(window, L"无法打开绘制验证会话。", L"交互验证", MB_OK); }
+            return 0;
+        }
         if (LOWORD(wp) == 7100) {
             const HWND source = FindWindowW(L"Picolet.ScrollFixture", nullptr);
             if (!source) { MessageBoxW(window, L"请先打开 picolet_scroll_fixture.exe。", L"交互验证", MB_OK); return 0; }
@@ -90,14 +191,20 @@ LRESULT CALLBACK Proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             document.bounds = {0, 0, document.image.width(), document.image.height()};
             std::swprintf(status, std::size(status), L"最近完成：%d × %d 像素，固定顶部 %d，底部 %d。", document.image.width(),
                           document.image.height(), placement.fixedTop, placement.fixedBottom);
+            documentMode = true;
             hr = editor.OpenEditor(instance, window, document, anchor, DefaultShortcuts(), AnnotationHistory{});
-            if (SUCCEEDED(hr)) capture.Close(); else capture.Retry(L"无法打开测试编辑器，请重试。");
+            if (SUCCEEDED(hr)) { capture.Close(); ObserveEditor(); } else capture.Retry(L"无法打开测试编辑器，请重试。");
             return 0;
         }
     case kOverlayAction: {
         if (reinterpret_cast<HWND>(lp) != editor.window()) return 0;
         const auto action = static_cast<OverlayAction>(wp);
+        if (action == OverlayAction::LongCapture) {
+            editor.Retry(L"此入口仅验证普通截图绘制，请返回测试入口开始长截图。");
+            return 0;
+        }
         if (action != OverlayAction::Cancel) {
+            if (!documentMode) anchor = editor.selection();
             Image image; editor.BeginOutput();
             auto hr = editor.Render(image);
             if (SUCCEEDED(hr)) {
@@ -113,7 +220,7 @@ LRESULT CALLBACK Proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
     }
     case WM_PAINT: {
         PAINTSTRUCT paint{}; const auto dc = BeginPaint(window, &paint);
-        RECT text{18, 76, 390, 160}; DrawTextW(dc, status, -1, &text, DT_WORDBREAK); EndPaint(window, &paint); return 0;
+        RECT text{18, 174, 460, 280}; DrawTextW(dc, status, -1, &text, DT_WORDBREAK); EndPaint(window, &paint); return 0;
     }
     case WM_DESTROY:
         capture.Close(); editor.Close(); pins.CloseAll(); PostQuitMessage(0); return 0;
@@ -135,7 +242,7 @@ int WINAPI wWinMain(HINSTANCE appInstance, HINSTANCE, PWSTR, int) {
     definition.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1); definition.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     definition.lpszClassName = L"Picolet.CaptureFixture"; RegisterClassW(&definition);
     const auto window = CreateWindowExW(0, definition.lpszClassName, L"Picolet 长截图测试入口", WS_OVERLAPPEDWINDOW,
-        1150, 120, 430, 240, nullptr, nullptr, instance, nullptr);
+        1150, 120, 520, 360, nullptr, nullptr, instance, nullptr);
     ShowWindow(window, SW_SHOW);
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {

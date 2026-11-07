@@ -3,6 +3,7 @@
 #include "capture_pipeline.h"
 #include "hotkeys.h"
 #include "win32.h"
+#include "paint_buffer.h"
 
 namespace picolet {
 
@@ -33,6 +34,8 @@ public:
     CapturePipelineSnapshot Snapshot() const noexcept { return pipeline_.Snapshot(); }
 
 private:
+    // 绘制回归测试使用固定快照验证脏区域，不启动采集线程或输入钩子。
+    friend struct PaintTestAccess;
     static LRESULT CALLBACK PanelProc(HWND, UINT, WPARAM, LPARAM) noexcept;
     static LRESULT CALLBACK MaskProc(HWND, UINT, WPARAM, LPARAM) noexcept;
     static LRESULT CALLBACK MouseHook(int, WPARAM, LPARAM) noexcept;
@@ -45,7 +48,15 @@ private:
     void PublishAction(ScrollAction action) noexcept;
     void Layout() noexcept;
     void Paint() noexcept;
+    // 完整绘制指定 DC 中被裁剪的浮窗区域，由 Paint 负责缓冲和最终提交。
+    void PaintContents(HDC dc) const noexcept;
     void UpdatePreview() noexcept;
+    // 接收只读快照并按可见变化刷新；版本及采集统计独立更新，不引起界面重绘。
+    void UpdateSnapshot(const CapturePipelineSnapshot& next) noexcept;
+    // 以下矩形均为浮窗客户区物理坐标，绘制与失效标记共用，避免旧文字/定位框残留。
+    RECT DimensionRect() const noexcept;
+    RECT StatusRect() const noexcept;
+    RECT PreviewPosition(const CapturePipelineSnapshot& snapshot) const noexcept;
     void Status(const wchar_t* text) noexcept;
     bool TargetForeground() const noexcept;
 
@@ -55,6 +66,7 @@ private:
     HWND finishButton_ = nullptr, cancelButton_ = nullptr;
     HHOOK mouseHook_ = nullptr, keyboardHook_ = nullptr;
     FontHandle font_;
+    PaintBuffer paintBuffer_;
     RECT area_{}, targetRect_{}, monitor_{}, previewRect_{};
     ScrollCapturePipeline pipeline_;
     CapturePipelineSnapshot snapshot_;

@@ -3,6 +3,7 @@
 #include "capture_edit.h"
 #include "hotkeys.h"
 #include "win32.h"
+#include "paint_buffer.h"
 
 #include <commctrl.h>
 
@@ -90,6 +91,8 @@ public:
     std::optional<LRESULT> DrawSlider(const NMHDR& item) const noexcept;
 
 private:
+    // 绘制测试核对无变化布局及标签的脏区域；不增加应用侧可调用接口。
+    friend struct PaintTestAccess;
     static constexpr auto kCount = static_cast<std::size_t>(ToolbarButton::Count);
     static LRESULT CALLBACK ButtonProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
                                        UINT_PTR id, DWORD_PTR data) noexcept;
@@ -104,6 +107,8 @@ private:
     std::array<std::array<wchar_t, 128>, kCount> tooltipText_{};
     FontHandle font_;
     FontHandle dimensionFont_;
+    // 控件由父窗口同步回调绘制，缓冲可复用；const 绘制方法只修改绘图资源。
+    mutable PaintBuffer controlPaintBuffer_;
     UINT dpi_ = USER_DEFAULT_SCREEN_DPI;
     UINT dimensionDpi_ = USER_DEFAULT_SCREEN_DPI;
     ToolbarView view_;
@@ -113,6 +118,11 @@ private:
     wchar_t dimensionText_[128]{};
     wchar_t statusText_[128]{};
     int value_ = 4;
+    int dimensionWidth_ = 0;
+    bool layoutValid_ = false;
+    ToolbarArea lastWork_{}, lastLabelScreen_{};
+    RECT lastSelection_{};
+    std::array<RECT, kCount> controlBounds_{};
 };
 
 }  // namespace picolet
