@@ -3,6 +3,7 @@
 #include "win32.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -30,6 +31,11 @@ bool SolidShape(const Annotation& mark) noexcept {
 }
 
 RECT InkBounds(const Annotation& mark) noexcept {
+    if (mark.tool == EditTool::Pixels) {
+        RECT bounds{};
+        for (const auto& fragment : mark.fragments) UnionRect(&bounds, &bounds, &fragment.bounds);
+        return bounds;
+    }
     RECT rect = DragBounds(mark.first, mark.last);
     if (mark.tool == EditTool::Text) {
         rect = {mark.first.x, mark.first.y, mark.clip.right, mark.clip.bottom};
@@ -277,6 +283,10 @@ HRESULT AnnotationHistory::Rebuild(const DesktopFrame& frame, std::size_t count,
         UnionRect(&patch.bounds, &patch.bounds, &ink);
     }
     IntersectRect(&patch.bounds, &patch.bounds, &frame.bounds);
+    if (IsRectEmpty(&patch.bounds)) {
+        patch_ = {};
+        return S_OK;
+    }
     const auto cropped = CropImage(frame, patch.bounds, patch.image);
     if (FAILED(cropped)) return cropped;
 
@@ -296,7 +306,21 @@ HRESULT AnnotationHistory::Rebuild(const DesktopFrame& frame, std::size_t count,
     const POINT origin{patch.bounds.left, patch.bounds.top};
     for (std::size_t i = 0; ok && i < total; ++i) {
         const auto& mark = markAt(i);
-        if (mark.tool == EditTool::Mosaic) {
+        if (mark.tool == EditTool::Pixels) {
+            ok = GdiFlush() != FALSE;
+            for (const auto& fragment : mark.fragments) {
+                RECT overlap{};
+                if (!IntersectRect(&overlap, &fragment.bounds, &patch.bounds)) continue;
+                const int width = fragment.bounds.right - fragment.bounds.left;
+                for (LONG y = overlap.top; y < overlap.bottom; ++y) {
+                    for (LONG x = overlap.left; x < overlap.right; ++x) {
+                        const auto index = static_cast<std::size_t>(y - fragment.bounds.top) * width + x - fragment.bounds.left;
+                        if (fragment.mask[index]) pixels[static_cast<std::size_t>(y - patch.bounds.top) * patch.image.width() +
+                                                        x - patch.bounds.left] = fragment.pixels[index];
+                    }
+                }
+            }
+        } else if (mark.tool == EditTool::Mosaic) {
             RECT rect = InkBounds(mark);
             if (IntersectRect(&rect, &rect, &patch.bounds)) {
                 ok = GdiFlush() != FALSE;
@@ -343,6 +367,69 @@ HRESULT AnnotationHistory::RenderMosaicDraft(const DesktopFrame& frame, const RE
     if (FAILED(status)) return status;
     Mosaic(result.pixels().data(), crop, crop);
     return S_OK;
+}
+
+HRESULT AnnotationHistory::MapToLongImage(const DesktopFrame& source, const RECT& sourceRect,
+    const SeedPlacement& placement, const DesktopFrame& target, AnnotationHistory& result) const noexcept {
+    const int width = sourceRect.right - sourceRect.left, height = sourceRect.bottom - sourceRect.top;
+    if (target.bounds.left || target.bounds.top || target.bounds.right != target.image.width() ||
+        target.bounds.bottom != target.image.height() || width != target.image.width() || height != placement.seedHeight ||
+        placement.resultHeight != target.image.height() || placement.fixedTop < 0 || placement.fixedBottom < 0 ||
+        placement.fixedTop + placement.fixedBottom >= height || placement.seedBodyTop < placement.fixedTop ||
+        placement.seedBodyTop + height - placement.fixedTop - placement.fixedBottom > placement.resultHeight - placement.fixedBottom)
+        return E_INVALIDARG;
+    Image before;
+    auto hr = CropImage(source, sourceRect, before);
+    if (FAILED(hr) || before.width() != width || before.height() != height) return FAILED(hr) ? hr : E_INVALIDARG;
+    AnnotationHistory mapped, prefix;
+    try {
+        mapped.marks_.reserve(marks_.size());
+        const std::array<int, 4> edges{0, placement.fixedTop, height - placement.fixedBottom, height};
+        const std::array<int, 3> destinations{0, placement.seedBodyTop, placement.resultHeight - placement.fixedBottom};
+        for (const auto& original : marks_) {
+            // prefix 始终在原冻结帧中重放，像素差异因此保留了原有裁剪、文字换行和马赛克分块。
+            hr = prefix.Commit(source, Annotation(original));
+            if (FAILED(hr)) return hr;
+            Image after;
+            hr = prefix.Render(source, sourceRect, after);
+            if (FAILED(hr)) return hr;
+            Annotation mark;
+            mark.tool = EditTool::Pixels;
+            mark.clip = target.bounds;
+            RECT ink = InkBounds(original), visible{};
+            if (IntersectRect(&visible, &ink, &sourceRect)) {
+                OffsetRect(&visible, -sourceRect.left, -sourceRect.top);
+                for (int band = 0; band < 3; ++band) {
+                    RECT area{visible.left, std::max(visible.top, static_cast<LONG>(edges[band])),
+                              visible.right, std::min(visible.bottom, static_cast<LONG>(edges[band + 1]))};
+                    if (IsRectEmpty(&area)) continue;
+                    AnnotationPixels fragment;
+                    fragment.bounds = area;
+                    OffsetRect(&fragment.bounds, 0, destinations[band] - edges[band]);
+                    const auto count = static_cast<std::size_t>(area.right - area.left) * (area.bottom - area.top);
+                    fragment.pixels.reserve(count);
+                    fragment.mask.reserve(count);
+                    bool changed = false;
+                    for (LONG y = area.top; y < area.bottom; ++y)
+                        for (LONG x = area.left; x < area.right; ++x) {
+                            const auto index = static_cast<std::size_t>(y) * width + x;
+                            const bool different = before.pixels()[index] != after.pixels()[index];
+                            fragment.pixels.push_back(after.pixels()[index]);
+                            fragment.mask.push_back(static_cast<BYTE>(different));
+                            changed |= different;
+                        }
+                    if (changed) mark.fragments.push_back(std::move(fragment));
+                }
+            }
+            mapped.marks_.push_back(std::move(mark));
+            before = std::move(after);
+        }
+        mapped.applied_ = applied_;
+        hr = mapped.Rebuild(target, applied_);
+        if (FAILED(hr)) return hr;
+        result = std::move(mapped);
+        return S_OK;
+    } catch (...) { return E_OUTOFMEMORY; }
 }
 
 }  // namespace picolet

@@ -4,11 +4,12 @@
 #include "hotkeys.h"
 #include "toolbar.h"
 #include "win32.h"
+#include "image_view.h"
 
 namespace picolet {
 
 inline constexpr UINT kOverlayAction = WM_APP + 2;
-enum class OverlayAction : WPARAM { Cancel, Copy, Save, Pin };
+enum class OverlayAction : WPARAM { Cancel, Copy, Save, Pin, LongCapture };
 
 // 置顶遮罩和选区工具栏。调用方保有冻结帧，在关闭遮罩之前不能修改或释放它。
 // 选区和标注使用桌面物理坐标，工具栏与尺寸标签各自按所在屏幕的 DPI 布局。
@@ -19,6 +20,19 @@ public:
     // 在冻结帧上开始一次会话，并复制本次会话的局部快捷键。anchor 是初始鼠标位置。
     HRESULT Open(HINSTANCE instance, HWND owner, const DesktopFrame& frame, POINT anchor,
                  const ShortcutBindings& shortcuts) noexcept;
+
+    // 在普通可调整窗口中编辑完整长图。frame 由应用持有，history 成功打开后才转移到本对象。
+    // anchor 为原桌面选区，仅用于选择窗口所在显示器和贴图位置；图片坐标从 (0,0) 开始。
+    HRESULT OpenEditor(HINSTANCE instance, HWND owner, const DesktopFrame& frame, RECT anchor,
+                       const ShortcutBindings& shortcuts, AnnotationHistory&& history) noexcept;
+
+    // 挂起普通遮罩，保留选区及历史。恢复时清除待处理标记，显示指定的中文状态。
+    void Suspend() noexcept;
+    void Resume(const wchar_t* status = nullptr) noexcept;
+
+    // 读取不含标注的首帧，以及完成采集后迁移原历史。失败均保留原会话。
+    HRESULT CaptureSeed(Image& result) const noexcept;
+    HRESULT MapHistory(const SeedPlacement& placement, const DesktopFrame& target, AnnotationHistory& result) const noexcept;
 
     // 从应用消息循环转发属于遮罩或工具栏的键盘消息。返回 true 时无需再分发这条消息。
     // 编辑文字时保留原生输入控件行为，不将输入解释成截图命令。
@@ -39,7 +53,7 @@ public:
     const RECT& selection() const noexcept { return selection_; }
 
 private:
-    enum class Drag { None, Create, Move, Resize, Mark };
+    enum class Drag { None, Create, Move, Resize, Mark, Pan };
 
     static LRESULT CALLBACK WindowProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) noexcept;
     static LRESULT CALLBACK TextProc(HWND window, UINT message, WPARAM wparam, LPARAM lparam,
@@ -63,7 +77,7 @@ private:
 
     // 根据画布命中位置或已捕获的拖动操作设置光标。point 使用桌面物理坐标。
     void SetCanvasCursor(POINT point) const noexcept;
-    // 窗口显示或拖动结束时同步光标，仅在鼠标实际指向本画布时生效。
+    // 窗口显示或拖动结束时同步光标，仅在鼠标命中本窗口客户区时生效；保留系统边框光标。
     void RefreshCursor() const noexcept;
 
     RECT ToClient(RECT rect) const noexcept;
@@ -80,6 +94,15 @@ private:
     // 在已裁到选区的 DC 上叠绘草稿，马赛克只在草稿区域需要重绘时计算像素。
     void PaintDraft(HDC dc) const noexcept;
     void Paint() noexcept;
+
+    // 长图编辑专用布局、可见行绘制、缩放和 32 位滚动条同步；普通截图仍使用原有桌面坐标。
+    void LayoutEditor() noexcept;
+    void PaintEditor(HDC dc) noexcept;
+    void DrawDocumentImage(HDC dc, const Image& image, RECT bounds) const noexcept;
+    void UpdateScrollbars() noexcept;
+    void ScrollEditor(int bar, UINT command) noexcept;
+    bool ChangeView() noexcept;
+    POINT ClientCursor() const noexcept;
 
     HWND window_ = nullptr;
     HWND owner_ = nullptr;
@@ -110,6 +133,16 @@ private:
     bool closing_ = false;
     bool composingText_ = false;
     bool paletteOpen_ = false;
+    bool editorMode_ = false;
+    bool suspended_ = false;
+    ImageViewport viewport_;
+    RECT overview_{};
+    Image overviewImage_;
+    HWND fitButton_ = nullptr, actualButton_ = nullptr;
+    FontHandle editorFont_;
+    UINT editorFontDpi_ = 0;
+    POINT panStart_{};
+    double panX_ = 0, panY_ = 0;
 };
 
 }  // namespace picolet

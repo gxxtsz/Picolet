@@ -41,6 +41,40 @@ struct DesktopFrame {
 // 在显示任何选区窗口之前获取各显示器的内容，空隙保留为黑色。
 HRESULT CaptureDesktop(DesktopFrame& result) noexcept;
 
+// 捕获单个显示器内的桌面物理矩形，不缩放、不包含鼠标指针。调用方须先排除采集界面。
+// 矩形必须完整位于同一显示器内；失败时不改变 result，像素的 Alpha 始终补为不透明。
+HRESULT CaptureRegion(const RECT& screenRect, Image& result) noexcept;
+
+// 可复用的同屏区域采集器。Open、Read、Close 和析构必须在同一线程执行；DC 与 DIB 不跨线程共享。
+// 内部 DIB 在 Open 时分配一次，Read 只抓取并复制到调用方拥有的缓冲，适合连续高频采集。
+class RegionCaptureSource {
+public:
+    RegionCaptureSource() = default;
+    ~RegionCaptureSource() { Close(); }
+    RegionCaptureSource(const RegionCaptureSource&) = delete;
+    RegionCaptureSource& operator=(const RegionCaptureSource&) = delete;
+
+    // 绑定同一显示器内的完整物理矩形。失败释放本次创建的资源，调用方可重新 Open。
+    HRESULT Open(const RECT& screenRect) noexcept;
+    // 已有输出缓冲尺寸一致时直接复用；GDI 刷新完成后才读取像素，成功时 Alpha 为不透明。
+    HRESULT Read(Image& buffer) noexcept;
+    // 在所属线程恢复原位图并释放所有 GDI 资源，可重复调用。
+    void Close() noexcept;
+private:
+    RECT rect_{};
+    HDC screen_ = nullptr, memory_ = nullptr;
+    HBITMAP bitmap_ = nullptr;
+    HGDIOBJ previous_ = nullptr;
+    const std::uint32_t* bits_ = nullptr;
+    DWORD thread_ = 0;
+};
+
+// 复制图片内的半开矩形；要求矩形完整有效。失败保留 result，可用于截取长图的独立条带。
+HRESULT CopyImageRect(const Image& image, const RECT& rect, Image& result) noexcept;
+
+// 只绘制图片的指定源矩形，避免长图在 GDI 中产生超大目标传输。源、目标均为半开矩形。
+bool DrawImageSection(HDC dc, const Image& image, const RECT& source, const RECT& destination) noexcept;
+
 // 两个鼠标端点都包含在选区内，返回裁到桌面范围后的半开矩形。
 // 鼠标起点与终点相同表示单击，返回空矩形以便重新选择。
 RECT SelectionRect(POINT first, POINT last, const RECT& bounds) noexcept;

@@ -1,6 +1,7 @@
 #include "export.h"
 #include "hotkeys.h"
 #include "overlay.h"
+#include "long_capture.h"
 #include "pins.h"
 #include "resources.h"
 #include "shortcut_dialog.h"
@@ -25,7 +26,7 @@ constexpr UINT kTrayIcon = 1;
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kCaptureRequest = WM_APP + 4;
 enum TrayCommand : UINT { TrayCapture = 2001, TraySettings, TrayExit };
-enum class Operation { Idle, PendingCapture, Selecting, EditingHotkeys, Output, Exiting };
+enum class Operation { Idle, PendingCapture, Selecting, Scrolling, EditingLong, EditingHotkeys, Output, Exiting };
 
 void ShowError(HWND owner, const wchar_t* message) noexcept {
     MessageBoxW(owner, message, kTitle, MB_OK | MB_ICONERROR);
@@ -53,6 +54,10 @@ private:
     void RequestCapture() noexcept;
     void StartCapture() noexcept;
     void HandleOverlayAction(OverlayAction action) noexcept;
+    // 长截图保留原遮罩直到新编辑器成功打开；取消或创建失败均可恢复原截图。
+    void StartLongCapture() noexcept;
+    void HandleScrollAction(ScrollAction action) noexcept;
+    SelectionOverlay& ActiveEditor() noexcept { return longEditing_ ? longEditor_ : overlay_; }
     void EndCapture(const wchar_t* error = nullptr) noexcept;
 
     HINSTANCE instance_;
@@ -66,6 +71,11 @@ private:
     Hotkeys hotkeys_;
     DesktopFrame frame_;
     SelectionOverlay overlay_;
+    SelectionOverlay longEditor_;
+    LongCaptureSession scrolling_;
+    DesktopFrame longFrame_;
+    RECT longAnchor_{};
+    bool longEditing_ = false;
     PinWindows pins_;
 };
 
@@ -81,7 +91,7 @@ bool App::Initialize() noexcept {
     definition.hIcon = icon_;
     definition.lpszClassName = kControllerClass;
     if (!RegisterClassExW(&definition) || !SelectionOverlay::Register(instance_, icon_) ||
-        !PinWindows::Register(instance_, icon_)) return false;
+        !PinWindows::Register(instance_, icon_) || !LongCaptureSession::Register(instance_, icon_)) return false;
     // 使用隐藏的顶层窗口。消息专用窗口收不到 Explorer 的托盘重建广播。
     if (!CreateWindowExW(WS_EX_TOOLWINDOW, kControllerClass, kTitle, WS_POPUP,
                          0, 0, 0, 0, nullptr, nullptr, instance_, this) || !AddTrayIcon()) return false;
@@ -93,7 +103,7 @@ int App::Run() noexcept {
     MSG message{};
     BOOL next;
     while ((next = GetMessageW(&message, nullptr, 0, 0)) > 0) {
-        if (operation_ == Operation::Selecting && overlay_.HandleKey(message)) continue;
+        if ((operation_ == Operation::Selecting || operation_ == Operation::EditingLong) && ActiveEditor().HandleKey(message)) continue;
         TranslateMessage(&message);
         DispatchMessageW(&message);
     }
@@ -131,10 +141,16 @@ LRESULT App::Handle(UINT message, WPARAM wparam, LPARAM lparam) noexcept {
         if (operation_ == Operation::PendingCapture) StartCapture();
         return 0;
     case kOverlayAction:
-        if (operation_ == Operation::Selecting) HandleOverlayAction(static_cast<OverlayAction>(wparam));
+        if ((operation_ == Operation::Selecting || operation_ == Operation::EditingLong) &&
+            reinterpret_cast<HWND>(lparam) == ActiveEditor().window()) HandleOverlayAction(static_cast<OverlayAction>(wparam));
+        return 0;
+    case kScrollAction:
+        if (operation_ == Operation::Scrolling && reinterpret_cast<HWND>(lparam) == scrolling_.window())
+            HandleScrollAction(static_cast<ScrollAction>(wparam));
         return 0;
     case WM_DISPLAYCHANGE:
-        if (operation_ == Operation::Selecting || operation_ == Operation::Output) overlay_.Cancel();
+        if (operation_ == Operation::Scrolling) scrolling_.StopForDisplayChange();
+        else if (!longEditing_ && (operation_ == Operation::Selecting || operation_ == Operation::Output)) overlay_.Cancel();
         return 0;
     case WM_ENDSESSION:
         if (wparam) DestroyWindow(window_);
@@ -143,6 +159,8 @@ LRESULT App::Handle(UINT message, WPARAM wparam, LPARAM lparam) noexcept {
         operation_ = Operation::Exiting;
         hotkeys_.Stop();
         overlay_.Close();
+        longEditor_.Close();
+        scrolling_.Close();
         pins_.CloseAll();
         if (trayAdded_) {
             auto data = TrayData();
@@ -261,49 +279,104 @@ void App::StartCapture() noexcept {
 }
 
 void App::HandleOverlayAction(OverlayAction action) noexcept {
-    if (action == OverlayAction::Cancel || overlay_.invalidated()) {
+    if (action == OverlayAction::LongCapture) { if (!longEditing_) StartLongCapture(); return; }
+    auto& editor = ActiveEditor();
+    if (action == OverlayAction::Cancel || editor.invalidated()) {
         EndCapture();
         return;
     }
     operation_ = Operation::Output;
-    overlay_.BeginOutput();
+    editor.BeginOutput();
     Image image;
-    const auto composed = overlay_.Render(image);
+    const auto composed = editor.Render(image);
     if (FAILED(composed)) {
-        operation_ = Operation::Selecting;
-        overlay_.Retry(L"无法生成图片，请重试。");
+        operation_ = longEditing_ ? Operation::EditingLong : Operation::Selecting;
+        editor.Retry(L"无法生成图片，请重试。");
         return;
     }
     HRESULT status = E_UNEXPECTED;
     const wchar_t* error = L"无法输出截图，请重试。";
     switch (action) {
     case OverlayAction::Copy:
-        status = CopyImageToClipboard(overlay_.window(), image);
+        status = CopyImageToClipboard(editor.window(), image);
         error = L"无法复制图片，请稍后重试。";
         break;
     case OverlayAction::Save:
-        status = SavePngWithDialog(overlay_.window(), image);
+        status = SavePngWithDialog(editor.window(), image);
         error = L"保存失败，请检查保存位置后重试。";
         break;
     case OverlayAction::Pin:
-        status = pins_.Open(instance_, window_, std::move(image), overlay_.selection());
+        status = pins_.Open(instance_, window_, std::move(image), longEditing_ ? longAnchor_ : editor.selection());
         error = L"无法打开贴图，请重试。";
         break;
     default:
         break;
     }
     if (operation_ == Operation::Exiting) return;
-    if (status == S_OK || overlay_.invalidated()) {
+    if (status == S_OK || editor.invalidated()) {
         EndCapture();
     } else {
-        operation_ = Operation::Selecting;
-        overlay_.Retry(FAILED(status) ? error : nullptr);
+        operation_ = longEditing_ ? Operation::EditingLong : Operation::Selecting;
+        editor.Retry(FAILED(status) ? error : nullptr);
     }
+}
+
+void App::StartLongCapture() noexcept {
+    Image seed, annotated;
+    if (FAILED(overlay_.CaptureSeed(seed)) || FAILED(overlay_.Render(annotated))) {
+        overlay_.Retry(L"无法准备长截图，请重试。");
+        return;
+    }
+    longAnchor_ = overlay_.selection();
+    operation_ = Operation::Scrolling;
+    overlay_.Suspend();
+    DwmFlush();
+    const auto hr = scrolling_.Open(instance_, window_, longAnchor_, seed, std::move(annotated),
+                                    hotkeys_.bindings()[ShortcutIndex(Shortcut::Cancel)]);
+    if (FAILED(hr)) {
+        scrolling_.Close();
+        operation_ = Operation::Selecting;
+        overlay_.Resume(L"长截图需至少 32×64 像素，并完整位于同一显示器的同一窗口中；请调整范围后重试。");
+    }
+}
+
+void App::HandleScrollAction(ScrollAction action) noexcept {
+    if (action == ScrollAction::Cancel) {
+        scrolling_.Close();
+        operation_ = Operation::Selecting;
+        overlay_.Resume();
+        return;
+    }
+    DesktopFrame document;
+    SeedPlacement placement;
+    auto hr = scrolling_.Finish(document.image, placement);
+    if (FAILED(hr)) { scrolling_.Retry(L"无法合成长图，已截内容已保留，请重试。"); return; }
+    document.bounds = {0, 0, document.image.width(), document.image.height()};
+    AnnotationHistory history;
+    hr = overlay_.MapHistory(placement, document, history);
+    if (FAILED(hr)) { scrolling_.Retry(L"无法迁移标注，已截内容已保留，请重试。"); return; }
+    longFrame_ = std::move(document);
+    hr = longEditor_.OpenEditor(instance_, window_, longFrame_, longAnchor_, hotkeys_.bindings(), std::move(history));
+    if (FAILED(hr)) {
+        longEditor_.Close();
+        longFrame_ = {};
+        scrolling_.Retry(L"无法打开长图编辑窗口，请重试。");
+        return;
+    }
+    scrolling_.Close();
+    overlay_.Close();
+    frame_ = {};
+    longEditing_ = true;
+    operation_ = Operation::EditingLong;
 }
 
 void App::EndCapture(const wchar_t* error) noexcept {
     overlay_.Close();
+    longEditor_.Close();
+    scrolling_.Close();
     frame_ = {};
+    longFrame_ = {};
+    longEditing_ = false;
     if (error) ShowError(window_, error);
     if (operation_ == Operation::Exiting) return;
     operation_ = Operation::Idle;

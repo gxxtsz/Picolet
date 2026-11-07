@@ -33,6 +33,7 @@ struct ControlSpec {
 
 constexpr std::array<ControlSpec, Index(Button::Count)> kControls{{
     {L"调整选区"}, {L"重选"}, {L"全屏", Shortcut::Fullscreen},
+    {L"长截图", Shortcut::LongCapture},
     {L"形状"}, {L"箭头"}, {L"画笔"}, {L"文字"}, {L"马赛克"},
     {L"撤销", Shortcut::Undo}, {L"重做", Shortcut::Redo},
     {L"贴图", Shortcut::Pin}, {L"另存为 PNG", Shortcut::Save}, {L"取消", Shortcut::Cancel},
@@ -116,6 +117,13 @@ void Glyph(Graphics& g, Button button, RECT rect, UINT dpi, COLORREF ink, COLORR
         line({{15, 4}, {20, 4}, {20, 9}});
         line({{20, 15}, {20, 20}, {15, 20}});
         line({{9, 20}, {4, 20}, {4, 15}});
+        break;
+    case Button::LongCapture:
+        line({{7, 3}, {4, 3}, {4, 21}, {7, 21}});
+        line({{17, 3}, {20, 3}, {20, 21}, {17, 21}});
+        line({{12, 4}, {12, 20}});
+        line({{9, 7}, {12, 4}, {15, 7}});
+        line({{9, 17}, {12, 20}, {15, 17}});
         break;
     case Button::Shapes:
         line({{6, 16}, {4, 16}, {4, 4}, {16, 4}, {16, 6}});
@@ -420,7 +428,8 @@ void CaptureToolbar::Layout(const ToolbarArea& workArea, const ToolbarArea& labe
         for (auto i = Index(first); i <= Index(last); ++i) main.Add(boxes[i], mainButton);
     };
     if (selected) {
-        addGroup(Button::Select, Button::Fullscreen, 0);
+        if (view.document) main.Add(boxes[Index(Button::Select)], mainButton);
+        else addGroup(Button::Select, Button::LongCapture, 0);
         addGroup(Button::Shapes, Button::Mosaic, 1);
         addGroup(Button::Undo, Button::Redo, 2);
         addGroup(Button::Pin, Button::Copy, 3);
@@ -470,7 +479,7 @@ void CaptureToolbar::Layout(const ToolbarArea& workArea, const ToolbarArea& labe
                              (paletteHeight ? gap + paletteHeight : 0);
     const LONG below = work.bottom - selection.bottom - gap;
     const LONG above = selection.top - work.top - gap;
-    const bool flipAbove = selected && below < blockHeight && above >= blockHeight;
+    const bool flipAbove = !view.document && selected && below < blockHeight && above >= blockHeight;
     const bool putBelow = !flipAbove;
     LONG desiredTop = work.top + tagHeight + gap;
     if (selected) {
@@ -478,8 +487,9 @@ void CaptureToolbar::Layout(const ToolbarArea& workArea, const ToolbarArea& labe
         else if (below >= blockHeight) desiredTop = selection.bottom + gap;
         else desiredTop = selection.bottom - gap - blockHeight;
     }
-    const LONG blockTop = std::clamp(desiredTop, work.top, std::max(work.top, work.bottom - blockHeight));
-    const LONG mainX = selected ? selection.right - mainWidth : (work.left + work.right - mainWidth) / 2;
+    const LONG blockTop = view.document ? work.top + gap :
+        std::clamp(desiredTop, work.top, std::max(work.top, work.bottom - blockHeight));
+    const LONG mainX = view.document ? work.left : selected ? selection.right - mainWidth : (work.left + work.right - mainWidth) / 2;
     main_ = Place(work, mainX, putBelow ? blockTop : blockTop + blockHeight - mainHeight, mainWidth, mainHeight);
     if (hasOptions) {
         const auto& activeBox = boxes[Index(ToolButton(view.tool))];
@@ -509,6 +519,11 @@ void CaptureToolbar::Layout(const ToolbarArea& workArea, const ToolbarArea& labe
     };
     if (selected) {
         LayoutDimension(labelScreen, selection);
+        if (view.document) {
+            std::swprintf(dimensionText_, std::size(dimensionText_), L"%ld × %ld 像素", view.imageSize.cx, view.imageSize.cy);
+            dimension_ = {work.left + gap, blockTop + blockHeight + gap,
+                          work.left + Dip(230, dpi), blockTop + blockHeight + gap + tagHeight};
+        }
     } else {
         dimensionFont_.reset();
         dimensionDpi_ = dpi;
@@ -525,6 +540,8 @@ void CaptureToolbar::Layout(const ToolbarArea& workArea, const ToolbarArea& labe
     }
 
     EnableWindow(controls_[Index(Button::Undo)], view.canUndo);
+    SetWindowTextW(controls_[Index(Button::Select)], view.document ? L"移动视图" : L"调整选区");
+    lstrcpynW(tooltipText_[Index(Button::Select)].data(), view.document ? L"移动视图" : L"调整选区", 128);
     EnableWindow(controls_[Index(Button::Redo)], view.canRedo);
     if (hasSize) {
         const bool text = view.tool == EditTool::Text;
@@ -553,6 +570,10 @@ void CaptureToolbar::Layout(const ToolbarArea& workArea, const ToolbarArea& labe
         InvalidateRect(controls_[i], nullptr, FALSE);
     }
     InvalidateSurfaces();
+}
+
+int CaptureToolbar::Bottom() const noexcept {
+    return std::max({main_.bottom, options_.bottom, palette_.bottom, dimension_.bottom, status_.bottom});
 }
 
 bool CaptureToolbar::Contains(POINT client) const noexcept {

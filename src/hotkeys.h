@@ -10,7 +10,7 @@ namespace picolet {
 
 // Capture 属于全局作用域；其余命令只在截图遮罩内生效。新增命令追加到末尾，
 // 使设置界面的控件编号和旧版本注册表中的命令索引保持一致。
-enum class Shortcut : std::size_t { Capture, Fullscreen, Copy, Save, Pin, Undo, Cancel, Redo, Count };
+enum class Shortcut : std::size_t { Capture, Fullscreen, Copy, Save, Pin, Undo, Cancel, Redo, LongCapture, Count };
 constexpr auto ShortcutIndex(Shortcut command) noexcept { return static_cast<std::size_t>(command); }
 inline constexpr auto kShortcutCount = ShortcutIndex(Shortcut::Count);
 inline constexpr UINT kShortcutModifiers = MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_WIN;
@@ -46,7 +46,8 @@ ShortcutResult ValidateBindings(const ShortcutBindings& bindings) noexcept;
 std::optional<Shortcut> MatchLocalShortcut(const ShortcutBindings& bindings, Hotkey received) noexcept;
 
 // 首字为格式版本，其余为按命令顺序排列的键。第 1 版沿用原有绑定，
-// 仅在截图内没有其他命令使用 Ctrl+Y 时为重做补上默认键。显式清除的键保持为空。
+// 仅在截图内没有其他命令使用 Ctrl+Y 时为重做补上默认键。第 2 版升级时同样按冲突情况
+// 为长截图补上 Ctrl+L；显式清除的已有命令保持为空，第 3 版完整保存全部命令。
 // 格式无效时尝试旧 DWORD 的低字，只迁移旧选区键，其余命令使用默认值。
 ShortcutWords EncodeBindings(const ShortcutBindings& bindings) noexcept;
 ShortcutBindings DecodeBindings(std::span<const WORD> words, std::optional<DWORD> legacy) noexcept;

@@ -157,6 +157,103 @@ RECT SelectionRect(POINT first, POINT last, const RECT& bounds) noexcept {
     return IsRectEmpty(&candidate) ? RECT{} : candidate;
 }
 
+HRESULT CaptureRegion(const RECT& rect, Image& result) noexcept {
+    MONITORINFO monitor{};
+    monitor.cbSize = sizeof(monitor);
+    if (IsRectEmpty(&rect) || !GetMonitorInfoW(MonitorFromRect(&rect, MONITOR_DEFAULTTONULL), &monitor) ||
+        rect.left < monitor.rcMonitor.left || rect.top < monitor.rcMonitor.top ||
+        rect.right > monitor.rcMonitor.right || rect.bottom > monitor.rcMonitor.bottom) return E_INVALIDARG;
+    Image image;
+    HRESULT hr = image.Resize(rect.right - rect.left, rect.bottom - rect.top);
+    if (FAILED(hr)) return hr;
+    const auto release = [](HDC dc) noexcept { ReleaseDC(nullptr, dc); };
+    const UniqueHandle<HDC, release> screen(GetDC(nullptr));
+    const MemoryDc memory(screen ? CreateCompatibleDC(screen.get()) : nullptr);
+    if (!memory) return LastErrorResult();
+    void* bits = nullptr;
+    const auto info = image.BitmapInfo();
+    const BitmapHandle bitmap(CreateDIBSection(screen.get(), &info, DIB_RGB_COLORS, &bits, nullptr, 0));
+    if (!bitmap || !bits) return LastErrorResult();
+    const auto old = SelectObject(memory.get(), bitmap.get());
+    if (!old || old == HGDI_ERROR) return LastErrorResult();
+    const bool ok = BitBlt(memory.get(), 0, 0, image.width(), image.height(), screen.get(), rect.left, rect.top,
+                           SRCCOPY | CAPTUREBLT) && GdiFlush();
+    SelectObject(memory.get(), old);
+    if (!ok) return LastErrorResult();
+    const auto* pixels = static_cast<const std::uint32_t*>(bits);
+    std::transform(pixels, pixels + image.pixels().size(), image.pixels().begin(),
+                   [](std::uint32_t value) { return value | kOpaque; });
+    result = std::move(image);
+    return S_OK;
+}
+
+HRESULT RegionCaptureSource::Open(const RECT& rect) noexcept {
+    Close();
+    MONITORINFO monitor{};
+    monitor.cbSize = sizeof(monitor);
+    if (IsRectEmpty(&rect) || !GetMonitorInfoW(MonitorFromRect(&rect, MONITOR_DEFAULTTONULL), &monitor) ||
+        rect.left < monitor.rcMonitor.left || rect.top < monitor.rcMonitor.top ||
+        rect.right > monitor.rcMonitor.right || rect.bottom > monitor.rcMonitor.bottom) return E_INVALIDARG;
+    Image dimensions;
+    const auto hr = dimensions.Resize(rect.right - rect.left, rect.bottom - rect.top);
+    if (FAILED(hr)) return hr;
+    thread_ = GetCurrentThreadId();
+    rect_ = rect;
+    screen_ = GetDC(nullptr);
+    if (screen_) memory_ = CreateCompatibleDC(screen_);
+    void* bits = nullptr;
+    const auto info = dimensions.BitmapInfo();
+    if (memory_) bitmap_ = CreateDIBSection(screen_, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
+    if (bitmap_ && bits) previous_ = SelectObject(memory_, bitmap_);
+    if (!previous_ || previous_ == HGDI_ERROR) {
+        previous_ = nullptr;
+        const auto error = LastErrorResult();
+        Close(); return error;
+    }
+    bits_ = static_cast<const std::uint32_t*>(bits);
+    return S_OK;
+}
+
+HRESULT RegionCaptureSource::Read(Image& buffer) noexcept {
+    if (!bits_ || GetCurrentThreadId() != thread_) return E_UNEXPECTED;
+    const int width = rect_.right - rect_.left, height = rect_.bottom - rect_.top;
+    if (buffer.width() != width || buffer.height() != height) {
+        const auto hr = buffer.Resize(width, height);
+        if (FAILED(hr)) return hr;
+    }
+    if (!BitBlt(memory_, 0, 0, width, height, screen_, rect_.left, rect_.top, SRCCOPY | CAPTUREBLT) || !GdiFlush())
+        return LastErrorResult();
+    std::transform(bits_, bits_ + buffer.pixels().size(), buffer.pixels().begin(),
+        [](std::uint32_t pixel) { return pixel | 0xff000000; });
+    return S_OK;
+}
+
+void RegionCaptureSource::Close() noexcept {
+    if (memory_) {
+        GdiFlush();
+        if (previous_) SelectObject(memory_, previous_);
+    }
+    if (bitmap_) DeleteObject(bitmap_);
+    if (memory_) DeleteDC(memory_);
+    if (screen_) ReleaseDC(nullptr, screen_);
+    bits_ = nullptr; previous_ = nullptr; bitmap_ = nullptr;
+    memory_ = screen_ = nullptr; thread_ = 0;
+}
+
+HRESULT CopyImageRect(const Image& image, const RECT& rect, Image& result) noexcept {
+    if (IsRectEmpty(&rect) || rect.left < 0 || rect.top < 0 || rect.right > image.width() ||
+        rect.bottom > image.height()) return E_INVALIDARG;
+    Image copy;
+    const auto hr = copy.Resize(rect.right - rect.left, rect.bottom - rect.top);
+    if (FAILED(hr)) return hr;
+    for (int y = 0; y < copy.height(); ++y)
+        std::memcpy(copy.pixels().data() + static_cast<std::size_t>(y) * copy.width(),
+                    image.pixels().data() + static_cast<std::size_t>(y + rect.top) * image.width() + rect.left,
+                    copy.stride());
+    result = std::move(copy);
+    return S_OK;
+}
+
 HRESULT CropImage(const DesktopFrame& frame, const RECT& screenRect, Image& result) noexcept {
     RECT crop{};
     if (frame.image.empty() ||
@@ -212,6 +309,21 @@ bool DrawImage(HDC dc, const Image& image, const RECT& destination) noexcept {
                                     destination.right - destination.left, destination.bottom - destination.top,
                                     0, 0, image.width(), image.height(), image.pixels().data(),
                                     &info, DIB_RGB_COLORS, SRCCOPY);
+    return copied != 0 && copied != static_cast<int>(GDI_ERROR);
+}
+
+bool DrawImageSection(HDC dc, const Image& image, const RECT& source, const RECT& destination) noexcept {
+    if (image.empty() || IsRectEmpty(&source) || IsRectEmpty(&destination) || source.left < 0 || source.top < 0 ||
+        source.right > image.width() || source.bottom > image.height()) return false;
+    // 以源条带首行作为 DIB 起点，宽度仍取原始 stride；纵向尺寸只包含可见的行。
+    auto info = image.BitmapInfo();
+    info.bmiHeader.biHeight = -(source.bottom - source.top);
+    info.bmiHeader.biSizeImage = image.stride() * (source.bottom - source.top);
+    const auto* pixels = image.pixels().data() + static_cast<std::size_t>(source.top) * image.width();
+    const int copied = StretchDIBits(dc, destination.left, destination.top,
+        destination.right - destination.left, destination.bottom - destination.top,
+        source.left, 0, source.right - source.left, source.bottom - source.top,
+        pixels, &info, DIB_RGB_COLORS, SRCCOPY);
     return copied != 0 && copied != static_cast<int>(GDI_ERROR);
 }
 

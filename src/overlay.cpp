@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdlib>
+#include <cmath>
 
 namespace picolet {
 namespace {
@@ -81,6 +82,7 @@ HRESULT SelectionOverlay::Open(HINSTANCE instance, HWND owner, const DesktopFram
         return 0xff000000u | ((pixel >> 1) & 0x007f7f7fu);
     });
     frame_ = &frame;
+    editorMode_ = suspended_ = false;
     owner_ = owner;
     shortcuts_ = shortcuts;
     anchor_ = anchor;
@@ -132,6 +134,35 @@ void SelectionOverlay::Close() noexcept {
     dark_ = {};
     history_.Clear();
     draft_ = {};
+    fitButton_ = actualButton_ = nullptr;
+    overviewImage_ = {};
+    editorFont_.reset();
+    editorFontDpi_ = 0;
+    suspended_ = false;
+}
+
+void SelectionOverlay::Suspend() noexcept {
+    suspended_ = true;
+    pending_ = false;
+    toolbar_.Hide();
+    ShowWindow(window_, SW_HIDE);
+}
+
+void SelectionOverlay::Resume(const wchar_t* status) noexcept {
+    suspended_ = false;
+    pending_ = busy_ = false;
+    ShowWindow(window_, SW_SHOW);
+    Retry(status);
+    InvalidateRect(window_, nullptr, FALSE);
+}
+
+HRESULT SelectionOverlay::CaptureSeed(Image& result) const noexcept {
+    return frame_ ? CropImage(*frame_, selection_, result) : E_UNEXPECTED;
+}
+
+HRESULT SelectionOverlay::MapHistory(const SeedPlacement& placement, const DesktopFrame& target,
+                                      AnnotationHistory& result) const noexcept {
+    return frame_ ? history_.MapToLongImage(*frame_, selection_, placement, target, result) : E_UNEXPECTED;
 }
 
 void SelectionOverlay::BeginOutput() noexcept {
@@ -184,9 +215,22 @@ bool SelectionOverlay::HandleKey(const MSG& message) noexcept {
         if (const HWND next = GetNextDlgTabItem(window_, current, (mods & MOD_SHIFT) != 0)) SetFocus(next);
         return true;
     }
-    if (down && message.wParam == VK_RETURN && !mods && toolbar_.IsButton(message.hwnd)) {
+    if (down && message.wParam == VK_RETURN && !mods && (toolbar_.IsButton(message.hwnd) ||
+        (editorMode_ && (message.hwnd == fitButton_ || message.hwnd == actualButton_)))) {
         if (!repeat) SendMessageW(message.hwnd, BM_CLICK, 0, 0);
         return true;
+    }
+    if (editorMode_ && down && !mods && message.hwnd == window_) {
+        switch (message.wParam) {
+        case VK_UP: ScrollEditor(SB_VERT, SB_LINEUP); return true;
+        case VK_DOWN: ScrollEditor(SB_VERT, SB_LINEDOWN); return true;
+        case VK_LEFT: ScrollEditor(SB_HORZ, SB_LINEUP); return true;
+        case VK_RIGHT: ScrollEditor(SB_HORZ, SB_LINEDOWN); return true;
+        case VK_PRIOR: ScrollEditor(SB_VERT, SB_PAGEUP); return true;
+        case VK_NEXT: ScrollEditor(SB_VERT, SB_PAGEDOWN); return true;
+        case VK_HOME: ScrollEditor(SB_VERT, SB_TOP); return true;
+        case VK_END: ScrollEditor(SB_VERT, SB_BOTTOM); return true;
+        }
     }
     return false;
 }
@@ -221,6 +265,37 @@ LRESULT SelectionOverlay::Handle(UINT message, WPARAM wparam, LPARAM lparam) noe
             if (!busy_ && !pending_) AdjustSize();
             return 0;
         }
+        if (editorMode_ && !lparam) { ScrollEditor(SB_HORZ, LOWORD(wparam)); return 0; }
+        break;
+    case WM_VSCROLL:
+        if (editorMode_) { ScrollEditor(SB_VERT, LOWORD(wparam)); return 0; }
+        break;
+    case WM_SIZE:
+        if (editorMode_ && !composingText_) {
+            if (textEdit_) FinishText(true);
+            LayoutEditor();
+            InvalidateRect(window_, nullptr, FALSE);
+        }
+        break;
+    case WM_GETMINMAXINFO:
+        if (editorMode_) {
+            auto& limits = *reinterpret_cast<MINMAXINFO*>(lparam);
+            limits.ptMinTrackSize = {Dip(560, dpi_), Dip(360, dpi_)};
+            return 0;
+        }
+        break;
+    case WM_MOUSEWHEEL:
+        if (editorMode_ && !busy_ && drag_ == Drag::None && ChangeView()) {
+            const int delta = GET_WHEEL_DELTA_WPARAM(wparam);
+            if (GET_KEYSTATE_WPARAM(wparam) & MK_CONTROL)
+                viewport_.ZoomAt(viewport_.zoom * std::pow(1.2, double(delta) / WHEEL_DELTA), ClientCursor());
+            else if (GET_KEYSTATE_WPARAM(wparam) & MK_SHIFT) viewport_.scrollX -= double(delta) / WHEEL_DELTA * Dip(90, dpi_);
+            else viewport_.scrollY -= double(delta) / WHEEL_DELTA * Dip(90, dpi_);
+            viewport_.Clamp();
+            UpdateScrollbars();
+            InvalidateRect(window_, nullptr, FALSE);
+            return 0;
+        }
         break;
     case WM_CTLCOLOREDIT:
         if (textEdit_ && reinterpret_cast<HWND>(lparam) == textEdit_) {
@@ -237,11 +312,14 @@ LRESULT SelectionOverlay::Handle(UINT message, WPARAM wparam, LPARAM lparam) noe
         if (LOWORD(wparam) != WA_INACTIVE) {
             activated_ = true;
             if (!busy_ && !closing_) SetFocus(textEdit_ ? textEdit_ : window_);
-        } else if (activated_ && !busy_ && !closing_) {
+        } else if (activated_ && !busy_ && !closing_ && !suspended_ && !editorMode_) {
             Cancel();
         }
         return 0;
     case WM_SETCURSOR:
+        // 只接管客户区的画布及工具栏光标。边框、标题栏和滚动条交给系统，
+        // 避免长图编辑窗口的原生缩放光标被画布光标覆盖。
+        if (LOWORD(lparam) != HTCLIENT) break;
         if (toolbar_.IsButton(reinterpret_cast<HWND>(wparam)) || toolbar_.IsSlider(reinterpret_cast<HWND>(wparam))) {
             SetCursor(LoadCursorW(nullptr, IDC_ARROW));
             return TRUE;
@@ -255,6 +333,15 @@ LRESULT SelectionOverlay::Handle(UINT message, WPARAM wparam, LPARAM lparam) noe
         }
         break;
     case WM_COMMAND:
+        if (editorMode_ && (reinterpret_cast<HWND>(lparam) == fitButton_ || reinterpret_cast<HWND>(lparam) == actualButton_)) {
+            if (!busy_ && !pending_ && ChangeView()) {
+                if (reinterpret_cast<HWND>(lparam) == fitButton_) viewport_.FitWidth();
+                else viewport_.ZoomAt(1.0, {viewport_.canvas.left, viewport_.canvas.top});
+                UpdateScrollbars();
+                InvalidateRect(window_, nullptr, FALSE);
+            }
+            return 0;
+        }
         if (const auto button = toolbar_.Clicked(wparam, lparam)) {
             if (!pending_ && !busy_) PressButton(*button);
             return 0;
@@ -263,7 +350,18 @@ LRESULT SelectionOverlay::Handle(UINT message, WPARAM wparam, LPARAM lparam) noe
     case WM_LBUTTONDOWN:
         if (!busy_ && !pending_ && drag_ == Drag::None) {
             const auto point = MessagePoint();
-            const POINT client{point.x - frame_->bounds.left, point.y - frame_->bounds.top};
+            const POINT client = editorMode_ ? ClientCursor() : POINT{point.x - frame_->bounds.left, point.y - frame_->bounds.top};
+            if (editorMode_ && PtInRect(&overview_, client)) {
+                if (ChangeView()) {
+                    viewport_.scrollY = double(client.y - overview_.top) / std::max(1L, overview_.bottom - overview_.top) *
+                        frame_->image.height() * viewport_.zoom - (viewport_.canvas.bottom - viewport_.canvas.top) / 2;
+                    viewport_.Clamp();
+                    UpdateScrollbars();
+                    InvalidateRect(window_, nullptr, FALSE);
+                }
+                return 0;
+            }
+            if (editorMode_ && !PtInRect(&viewport_.canvas, client)) return 0;
             if (!toolbar_.Contains(client)) {
                 const bool hadPalette = std::exchange(paletteOpen_, false);
                 if (FinishText(true)) BeginDrag(point);
@@ -285,11 +383,23 @@ LRESULT SelectionOverlay::Handle(UINT message, WPARAM wparam, LPARAM lparam) noe
         if (!busy_) Cancel();
         return 0;
     case WM_DISPLAYCHANGE:
+        if (suspended_) return 0;
+        if (editorMode_) { LayoutEditor(); InvalidateRect(window_, nullptr, FALSE); return 0; }
+        Cancel();
+        return 0;
     case WM_CLOSE:
         Cancel();
         return 0;
     case WM_DPICHANGED:
-        if (activated_ && !closing_) Cancel();
+        if (editorMode_) {
+            dpi_ = HIWORD(wparam);
+            const auto& suggested = *reinterpret_cast<const RECT*>(lparam);
+            SetWindowPos(window_, nullptr, suggested.left, suggested.top, suggested.right - suggested.left,
+                         suggested.bottom - suggested.top, SWP_NOZORDER | SWP_NOACTIVATE);
+            LayoutEditor();
+            return 0;
+        }
+        if (activated_ && !closing_ && !suspended_) Cancel();
         return 0;
     }
     return DefWindowProcW(window_, message, wparam, lparam);
@@ -297,7 +407,14 @@ LRESULT SelectionOverlay::Handle(UINT message, WPARAM wparam, LPARAM lparam) noe
 
 void SelectionOverlay::Command(Shortcut shortcut) noexcept {
     switch (shortcut) {
-    case Shortcut::Fullscreen: SelectFullscreen(); break;
+    case Shortcut::Fullscreen:
+        if (editorMode_) {
+            if (ChangeView()) { viewport_.FitWidth(); UpdateScrollbars(); InvalidateRect(window_, nullptr, FALSE); }
+        } else SelectFullscreen();
+        break;
+    case Shortcut::LongCapture:
+        if (!editorMode_ && FinishText(true)) PostAction(OverlayAction::LongCapture);
+        break;
     case Shortcut::Copy: PostAction(OverlayAction::Copy); break;
     case Shortcut::Save: PostAction(OverlayAction::Save); break;
     case Shortcut::Pin: PostAction(OverlayAction::Pin); break;
@@ -364,6 +481,7 @@ void SelectionOverlay::PressButton(ToolbarButton button) noexcept {
         break;
     }
     case Button::Fullscreen: Command(Shortcut::Fullscreen); return;
+    case Button::LongCapture: Command(Shortcut::LongCapture); return;
     case Button::Undo: Command(Shortcut::Undo); return;
     case Button::Redo: Command(Shortcut::Redo); return;
     case Button::Copy: Command(Shortcut::Copy); return;
@@ -391,9 +509,9 @@ void SelectionOverlay::PostAction(OverlayAction action) noexcept {
     if (pending_ || busy_ || closing_ || (action != OverlayAction::Cancel && IsRectEmpty(&selection_))) return;
     pending_ = true;
     // 让按钮和窗口过程先返回，再由控制窗口销毁遮罩或打开系统对话框。
-    if (!PostMessageW(owner_, kOverlayAction, static_cast<WPARAM>(action), 0)) {
+    if (!PostMessageW(owner_, kOverlayAction, static_cast<WPARAM>(action), reinterpret_cast<LPARAM>(window_))) {
         pending_ = false;
-        if (action == OverlayAction::Cancel) SendMessageW(owner_, kOverlayAction, static_cast<WPARAM>(action), 0);
+        if (action == OverlayAction::Cancel) SendMessageW(owner_, kOverlayAction, static_cast<WPARAM>(action), reinterpret_cast<LPARAM>(window_));
         else Status(L"无法执行截图操作，请重试。");
     }
 }
@@ -416,6 +534,7 @@ void SelectionOverlay::SelectFullscreen() noexcept {
 }
 
 POINT SelectionOverlay::MessagePoint() const noexcept {
+    if (editorMode_) return viewport_.ToImage(ClientCursor());
     const auto& bounds = frame_->bounds;
     if (bounds.left >= -32768 && bounds.top >= -32768 && bounds.right <= 32767 && bounds.bottom <= 32767) {
         const DWORD position = GetMessagePos();
@@ -427,6 +546,13 @@ POINT SelectionOverlay::MessagePoint() const noexcept {
 }
 
 void SelectionOverlay::SetCanvasCursor(POINT point) const noexcept {
+    if (editorMode_) {
+        const auto client = ClientCursor();
+        LPCWSTR cursor = !PtInRect(&viewport_.canvas, client) || busy_ ? IDC_ARROW :
+            tool_ == EditTool::Select ? IDC_HAND : tool_ == EditTool::Text ? IDC_IBEAM : IDC_CROSS;
+        SetCursor(cursor == IDC_CROSS && crosshair_ ? crosshair_.get() : LoadCursorW(nullptr, cursor));
+        return;
+    }
     LPCWSTR shape = IDC_CROSS;
     const POINT client{point.x - frame_->bounds.left, point.y - frame_->bounds.top};
     if (drag_ == Drag::None && (busy_ || toolbar_.Contains(client))) {
@@ -448,7 +574,12 @@ void SelectionOverlay::SetCanvasCursor(POINT point) const noexcept {
 
 void SelectionOverlay::RefreshCursor() const noexcept {
     POINT point{};
-    if (window_ && GetCursorPos(&point) && WindowFromPoint(point) == window_) SetCanvasCursor(point);
+    if (!window_ || !GetCursorPos(&point) || WindowFromPoint(point) != window_) return;
+    POINT client = point;
+    RECT bounds{};
+    // WindowFromPoint 也可能命中本窗口的非客户区；主动同步时同样须保留系统边框光标。
+    if (!ScreenToClient(window_, &client) || !GetClientRect(window_, &bounds) || !PtInRect(&bounds, client)) return;
+    SetCanvasCursor(point);
 }
 
 unsigned SelectionOverlay::HitEdges(POINT point) const noexcept {
@@ -482,7 +613,12 @@ Annotation SelectionOverlay::MakeMark(POINT point) const noexcept {
 void SelectionOverlay::BeginDrag(POINT point) noexcept {
     start_ = point;
     original_ = selection_;
-    if (IsRectEmpty(&selection_)) {
+    if (editorMode_ && tool_ == EditTool::Select) {
+        drag_ = Drag::Pan;
+        panStart_ = ClientCursor();
+        panX_ = viewport_.scrollX;
+        panY_ = viewport_.scrollY;
+    } else if (IsRectEmpty(&selection_)) {
         drag_ = Drag::Create;
     } else if (tool_ == EditTool::Select) {
         edges_ = HitEdges(point);
@@ -499,14 +635,14 @@ void SelectionOverlay::BeginDrag(POINT point) noexcept {
     if (drag_ != Drag::None) {
         status_ = nullptr;
         SetFocus(window_);
-        toolbar_.Hide();
+        if (!editorMode_) toolbar_.Hide();
         SetCapture(window_);
         if (GetCapture() != window_) {
             AbortDrag();
             return;
         }
         SetCanvasCursor(point);
-        if (drag_ != Drag::Mark && !IsRectEmpty(&selection_)) {
+        if (!editorMode_ && drag_ != Drag::Mark && !IsRectEmpty(&selection_)) {
             toolbar_.LayoutDimension(DimensionScreen(), ToClient(selection_));
             RepaintSelection(selection_);
         }
@@ -517,6 +653,15 @@ void SelectionOverlay::UpdateDrag(POINT point) noexcept {
     const RECT previous = selection_;
     const POINT delta{point.x - start_.x, point.y - start_.y};
     switch (drag_) {
+    case Drag::Pan: {
+        const auto cursor = ClientCursor();
+        viewport_.scrollX = panX_ - (cursor.x - panStart_.x);
+        viewport_.scrollY = panY_ - (cursor.y - panStart_.y);
+        viewport_.Clamp();
+        UpdateScrollbars();
+        InvalidateRect(window_, nullptr, FALSE);
+        return;
+    }
     case Drag::Create: selection_ = SelectionRect(start_, point, frame_->bounds); break;
     case Drag::Move: selection_ = MoveSelection(original_, delta, frame_->bounds); break;
     case Drag::Resize: selection_ = ResizeSelection(original_, edges_, delta, frame_->bounds); break;
@@ -581,8 +726,15 @@ void SelectionOverlay::BeginText(POINT point) noexcept {
     point.x = std::min(point.x, selection_.right - width);
     point.y = std::min(point.y, selection_.bottom - height);
     draft_ = MakeMark(point);
-    textFont_.reset(CreateAnnotationFont(draft_.textSize));
-    const RECT box = ToClient({point.x, point.y, selection_.right, point.y + height});
+    textFont_.reset(CreateAnnotationFont(editorMode_ ? std::max(1, static_cast<int>(std::lround(draft_.textSize * viewport_.zoom))) : draft_.textSize));
+    RECT box = ToClient({point.x, point.y, selection_.right, point.y + height});
+    if (editorMode_) {
+        box.left = std::max(box.left, viewport_.canvas.left);
+        box.top = std::max(box.top, viewport_.canvas.top);
+        box.right = std::min(box.right, viewport_.canvas.right);
+        box.bottom = std::min(viewport_.canvas.bottom, std::max(box.bottom, box.top + Dip(70, dpi_)));
+        draft_.clip.right = std::min(selection_.right, viewport_.ToImage({box.right, box.top}).x);
+    }
     textEdit_ = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP |
                                 ES_MULTILINE | ES_AUTOVSCROLL | ES_WANTRETURN | WS_VSCROLL,
                                 box.left, box.top, box.right - box.left, box.bottom - box.top,
@@ -605,7 +757,7 @@ void SelectionOverlay::UpdateTextStyle() noexcept {
     if (!textEdit_) return;
     draft_.color = kToolbarColors[style_.color];
     if (style_.textSize != draft_.textSize) {
-        if (const HFONT font = CreateAnnotationFont(style_.textSize)) {
+        if (const HFONT font = CreateAnnotationFont(editorMode_ ? std::max(1, static_cast<int>(std::lround(style_.textSize * viewport_.zoom))) : style_.textSize)) {
             SendMessageW(textEdit_, WM_SETFONT, reinterpret_cast<WPARAM>(font), FALSE);
             textFont_.reset(font);
             draft_.textSize = style_.textSize;
@@ -621,6 +773,7 @@ bool SelectionOverlay::FinishText(bool commit) noexcept {
         const int length = GetWindowTextW(textEdit_, text, static_cast<int>(std::size(text)));
         if (length) {
             Annotation mark = MakeMark(draft_.first);
+            mark.clip = draft_.clip;
             mark.textSize = draft_.textSize;
             try {
                 mark.text.assign(text, static_cast<std::size_t>(length));
@@ -666,6 +819,7 @@ LRESULT CALLBACK SelectionOverlay::TextProc(HWND window, UINT message, WPARAM wp
 }
 
 RECT SelectionOverlay::ToClient(RECT rect) const noexcept {
+    if (editorMode_) return viewport_.ToClient(rect);
     if (!IsRectEmpty(&rect)) OffsetRect(&rect, -frame_->bounds.left, -frame_->bounds.top);
     return rect;
 }
@@ -682,6 +836,7 @@ ToolbarArea SelectionOverlay::DimensionScreen() const noexcept {
 }
 
 void SelectionOverlay::LayoutPanel() noexcept {
+    if (editorMode_) { LayoutEditor(); return; }
     if (closing_ || busy_ || drag_ != Drag::None || !window_) return;
     const bool selected = !IsRectEmpty(&selection_);
     const HMONITOR monitor = selected ? MonitorFromRect(&selection_, MONITOR_DEFAULTTONEAREST)
@@ -702,6 +857,11 @@ void SelectionOverlay::Status(const wchar_t* text) noexcept {
 }
 
 void SelectionOverlay::RepaintSelection(const RECT& previous) noexcept {
+    if (editorMode_) {
+        overviewImage_ = {};
+        InvalidateRect(window_, nullptr, FALSE);
+        return;
+    }
     RECT changed{};
     if (UnionRect(&changed, &previous, &selection_)) {
         changed = ToClient(changed);
@@ -730,13 +890,27 @@ void SelectionOverlay::PaintDraft(HDC dc) const noexcept {
             return;
         }
     }
-    DrawAnnotationDraft(dc, draft_, {frame_->bounds.left, frame_->bounds.top});
+    if (editorMode_) {
+        const int saved = SaveDC(dc);
+        const auto origin = viewport_.Origin();
+        SetGraphicsMode(dc, GM_ADVANCED);
+        const XFORM transform{static_cast<FLOAT>(viewport_.zoom), 0, 0, static_cast<FLOAT>(viewport_.zoom),
+                              static_cast<FLOAT>(origin.x), static_cast<FLOAT>(origin.y)};
+        SetWorldTransform(dc, &transform);
+        DrawAnnotationDraft(dc, draft_, {0, 0});
+        if (saved) RestoreDC(dc, saved);
+    } else DrawAnnotationDraft(dc, draft_, {frame_->bounds.left, frame_->bounds.top});
 }
 
 void SelectionOverlay::Paint() noexcept {
     PAINTSTRUCT paint{};
     HDC dc = BeginPaint(window_, &paint);
     if (!dc || !frame_) {
+        EndPaint(window_, &paint);
+        return;
+    }
+    if (editorMode_) {
+        PaintEditor(dc);
         EndPaint(window_, &paint);
         return;
     }

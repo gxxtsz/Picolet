@@ -13,7 +13,7 @@ namespace picolet {
 
 // 控件顺序即 Tab 顺序。主栏、参数栏和色板中的按钮都由同一个遮罩窗口接收命令。
 enum class ToolbarButton : std::size_t {
-    Select, Reselect, Fullscreen, Shapes, Arrow, Pen, Text, Mosaic, Undo, Redo, Pin, Save, Cancel, Copy,
+    Select, Reselect, Fullscreen, LongCapture, Shapes, Arrow, Pen, Text, Mosaic, Undo, Redo, Pin, Save, Cancel, Copy,
     Rectangle, Ellipse, Line, Outline, Solid, Size, Color, Red, Yellow, Green, Blue, White, Black, Count
 };
 
@@ -42,6 +42,8 @@ struct ToolbarView {
     bool canUndo = false;
     bool canRedo = false;
     bool paletteOpen = false;
+    bool document = false;  // 长图编辑时固定主栏，Select 用作移动视图，隐藏重选、全屏和长截图。
+    SIZE imageSize{};       // 文档模式尺寸标签使用原图像素，不随预览缩放。
 };
 
 // 显示区域使用遮罩客户区的物理坐标，dpi 只决定此处的界面尺寸和字体。
@@ -70,6 +72,9 @@ public:
     // 隐藏两级工具栏、色板和所有标签。拖动选区时可再单独调用 LayoutDimension。
     void Hide() noexcept;
     bool Contains(POINT client) const noexcept;
+
+    // 文档模式下工具栏和状态标签的最低边缘，供编辑器把画布放在控件下方。
+    int Bottom() const noexcept;
 
     // 判断消息是否由本工具栏的控件发出。滑块值由原生控件处理，SetValue 仅同步数值标签，
     // 使拖动期间不会重排参数栏。

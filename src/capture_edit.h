@@ -1,6 +1,7 @@
 #pragma once
 
 #include "image.h"
+#include "scroll_stitcher.h"
 
 #include <string>
 #include <vector>
@@ -19,7 +20,15 @@ RECT ResizeSelection(RECT selection, unsigned edges, POINT delta, const RECT& bo
 // 按鼠标位置选取单台显示器的完整物理范围（含任务栏），并裁到冻结帧的边界。
 RECT SelectMonitor(POINT cursor, const RECT& bounds) noexcept;
 
-enum class EditTool { Select, Rectangle, Ellipse, Line, Arrow, Pen, Text, Mosaic };
+enum class EditTool { Select, Rectangle, Ellipse, Line, Arrow, Pen, Text, Mosaic, Pixels };
+
+// 迁移已有标注时保存的不可变像素片段。mask 为零的像素保留底图，避免覆盖标注以外的正文。
+// 一笔可以有多个片段，但仍只占一条撤销记录；Pixels 是内部工具，不出现在工具栏中。
+struct AnnotationPixels {
+    RECT bounds{};
+    std::vector<std::uint32_t> pixels;
+    std::vector<BYTE> mask;
+};
 
 // 一笔已经提交或仍在编辑的标注。坐标和线宽使用物理像素；clip 是创建时的选区，
 // 防止移走或放大选区后，在原来不可绘制的地方露出笔画。filled 只用于矩形和椭圆，
@@ -35,6 +44,7 @@ struct Annotation {
     bool filled = false;
     std::vector<POINT> path;
     std::wstring text;
+    std::vector<AnnotationPixels> fragments;
 };
 
 // 在已有像素之上绘制尚未提交的标注；origin 为设备上下文 (0, 0) 对应的桌面坐标。
@@ -67,6 +77,12 @@ public:
     // area 由调用方限制在笔画的选区内，本方法再裁到冻结帧边缘。
     // 只有返回 S_OK 时才替换 result。无交集时返回 S_FALSE，调用不会修改标注历史。
     HRESULT RenderMosaicDraft(const DesktopFrame& frame, const RECT& area, Image& result) const noexcept;
+
+    // 将完整历史（含重做分支）映射到长图。sourceRect 是首帧的桌面物理矩形，placement 描述
+    // 固定头、正文和固定尾的位置。逐笔保存像素差异，保证跨段文字和马赛克的原始效果。
+    // target 使用图片局部坐标，必须从 (0,0) 开始；所有转换成功后才替换 result，源历史不变。
+    HRESULT MapToLongImage(const DesktopFrame& source, const RECT& sourceRect, const SeedPlacement& placement,
+                           const DesktopFrame& target, AnnotationHistory& result) const noexcept;
 
 private:
     // 按前 count 笔合成。追加新标注时，把候选笔画叠在此前缀上，重做分支留待提交后清理。
