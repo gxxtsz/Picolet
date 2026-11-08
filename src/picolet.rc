@@ -2,11 +2,40 @@
 
 #include <windows.h>
 #include "resources.h"
+#include "picolet_version.h"
 
-1 RT_MANIFEST "picolet.manifest"
+1 RT_MANIFEST PICOLET_MANIFEST_PATH
 IDI_PICOLET ICON "picolet.ico"
 
-IDD_HOTKEYS DIALOGEX 0, 0, 266, 366
+// 文件属性使用简体中文和 Unicode 字符集；数值版本及文本版本均来自构建生成的头文件。
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION PICOLET_VERSION_NUMBERS
+PRODUCTVERSION PICOLET_VERSION_NUMBERS
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE 0
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404b0"
+        BEGIN
+            VALUE "FileDescription", "Picolet 截图工具\0"
+            VALUE "FileVersion", PICOLET_WINDOWS_VERSION_TEXT
+            VALUE "InternalName", "Picolet\0"
+            VALUE "OriginalFilename", "Picolet.exe\0"
+            VALUE "ProductName", "Picolet\0"
+            VALUE "ProductVersion", PICOLET_WINDOWS_VERSION_TEXT
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END
+
+IDD_HOTKEYS DIALOGEX 0, 0, 266, 388
 STYLE DS_SETFONT | DS_MODALFRAME | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 CAPTION "Picolet 设置"
 FONT 9, "Microsoft YaHei UI"
@@ -50,4 +79,5 @@ BEGIN
     PUSHBUTTON "恢复快捷键默认", IDC_SHORTCUT_RESTORE, 12, 340, 96, 16
     DEFPUSHBUTTON "保存", IDOK, 140, 340, 52, 16
     PUSHBUTTON "取消", IDCANCEL, 202, 340, 52, 16
+    LTEXT "", IDC_APP_VERSION, 12, 366, 242, 12, SS_NOPREFIX
 END

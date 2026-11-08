@@ -2,6 +2,7 @@
 
 #include "resources.h"
 #include "settings.h"
+#include "picolet_version.h"
 
 #include <commctrl.h>
 
@@ -26,6 +27,8 @@ public:
             auto* self = reinterpret_cast<SettingsDialog*>(lparam);
             SetWindowLongPtrW(dialog, DWLP_USER, reinterpret_cast<LONG_PTR>(self));
             self->dialog_ = dialog;
+            // 版本是构建时确定的只读信息，不进入设置草稿或注册表，也不参与 Tab 焦点切换。
+            SetDlgItemTextW(dialog, IDC_APP_VERSION, L"Picolet 版本：" PICOLET_VERSION_WTEXT);
             for (std::size_t i = 0; i < kShortcutCount; ++i) {
                 if (!SetWindowSubclass(GetDlgItem(dialog, IDC_SHORTCUT_FIRST + static_cast<int>(i)),
                                        RecordButton, 1, reinterpret_cast<DWORD_PTR>(self))) {

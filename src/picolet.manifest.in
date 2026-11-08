@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity type="win32" name="Picolet.Screenshot" version="1.0.0.0" processorArchitecture="amd64"/>
+  <assemblyIdentity type="win32" name="Picolet.Screenshot" version="@PICOLET_WINDOWS_VERSION@" processorArchitecture="amd64"/>
   <description>Picolet 截图工具</description>
   <dependency>
     <dependentAssembly>

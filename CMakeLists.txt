@@ -11,10 +11,17 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
+# 界面、文件属性和程序清单共用 project() 中的版本；Windows 四段版本的末段固定为 0。
+# 生成文件保留在各自构建目录，避免 MSVC 和 MinGW 构建相互覆盖。
+set(PICOLET_WINDOWS_VERSION "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}.${PROJECT_VERSION_PATCH}.0")
+set(PICOLET_GENERATED_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+configure_file(src/picolet_version.h.in "${PICOLET_GENERATED_DIR}/picolet_version.h" @ONLY)
+configure_file(src/picolet.manifest.in "${PICOLET_GENERATED_DIR}/picolet.manifest" @ONLY)
+
 find_package(Threads REQUIRED)
 add_library(picolet_core STATIC src/image.cpp src/capture_edit.cpp src/export.cpp src/hotkeys.cpp src/startup.cpp
     src/scroll_stitcher.cpp src/scroll_tracker.cpp src/capture_pipeline.cpp)
-target_include_directories(picolet_core PUBLIC src)
+target_include_directories(picolet_core PUBLIC src "${PICOLET_GENERATED_DIR}")
 target_compile_definitions(picolet_core PUBLIC UNICODE _UNICODE NOMINMAX WIN32_LEAN_AND_MEAN
     WINVER=0x0A00 _WIN32_WINNT=0x0A00)
 target_link_libraries(picolet_core PUBLIC gdi32 user32 ole32 shell32 uuid windowscodecs advapi32 Threads::Threads)
@@ -22,7 +29,7 @@ target_link_libraries(picolet_core PUBLIC gdi32 user32 ole32 shell32 uuid window
 add_executable(Picolet WIN32
     src/app.cpp src/overlay.cpp src/long_editor.cpp src/long_capture.cpp src/toolbar.cpp src/pins.cpp src/shortcut_dialog.cpp src/picolet.rc)
 set_property(SOURCE src/picolet.rc APPEND PROPERTY OBJECT_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/picolet.manifest;${CMAKE_CURRENT_SOURCE_DIR}/src/picolet.ico")
+    "${PICOLET_GENERATED_DIR}/picolet_version.h;${PICOLET_GENERATED_DIR}/picolet.manifest;${CMAKE_CURRENT_SOURCE_DIR}/src/picolet.ico")
 target_link_libraries(Picolet PRIVATE picolet_core comctl32 dwmapi gdiplus shcore)
 
 include(CTest)
