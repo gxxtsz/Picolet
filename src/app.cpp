@@ -5,6 +5,7 @@
 #include "pins.h"
 #include "resources.h"
 #include "shortcut_dialog.h"
+#include "startup.h"
 #include "win32.h"
 
 #include <commctrl.h>
@@ -26,7 +27,7 @@ constexpr UINT kTrayIcon = 1;
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kCaptureRequest = WM_APP + 4;
 enum TrayCommand : UINT { TrayCapture = 2001, TraySettings, TrayExit };
-enum class Operation { Idle, PendingCapture, Selecting, Scrolling, EditingLong, EditingHotkeys, Output, Exiting };
+enum class Operation { Idle, PendingCapture, Selecting, Scrolling, EditingLong, EditingSettings, Output, Exiting };
 
 void ShowError(HWND owner, const wchar_t* message) noexcept {
     MessageBoxW(owner, message, kTitle, MB_OK | MB_ICONERROR);
@@ -35,7 +36,7 @@ void ShowError(HWND owner, const wchar_t* message) noexcept {
 // 隐藏的顶层窗口统一接收托盘、热键与显示变化。冻结帧、会话和输出在同一线程串行管理。
 class App {
 public:
-    explicit App(HINSTANCE instance) noexcept : instance_(instance) {}
+    explicit App(HINSTANCE instance, bool autostart) noexcept : instance_(instance), autostart_(autostart) {}
     ~App() { if (window_) DestroyWindow(window_); }
 
     bool Initialize() noexcept;
@@ -66,6 +67,9 @@ private:
     UINT taskbarCreated_ = 0;
     bool trayAdded_ = false;
     bool trayVersion4_ = false;
+    bool autostart_ = false;
+    bool hotkeysStarted_ = false;
+    TrayStartupRetry trayRetry_;
     bool menuOpen_ = false;
     Operation operation_ = Operation::Idle;
     Hotkeys hotkeys_;
@@ -94,9 +98,10 @@ bool App::Initialize() noexcept {
         !PinWindows::Register(instance_, icon_) || !LongCaptureSession::Register(instance_, icon_)) return false;
     // 使用隐藏的顶层窗口。消息专用窗口收不到 Explorer 的托盘重建广播。
     if (!CreateWindowExW(WS_EX_TOOLWINDOW, kControllerClass, kTitle, WS_POPUP,
-                         0, 0, 0, 0, nullptr, nullptr, instance_, this) || !AddTrayIcon()) return false;
-    hotkeys_.Start(window_);
-    return true;
+                         0, 0, 0, 0, nullptr, nullptr, instance_, this)) return false;
+    if (AddTrayIcon()) return true;
+    // 登录启动时 Explorer 可能仍在初始化：保留消息循环异步等待，不阻塞界面线程。
+    return autostart_ && SUCCEEDED(trayRetry_.Begin(window_, GetTickCount64()));
 }
 
 int App::Run() noexcept {
@@ -127,10 +132,20 @@ LRESULT CALLBACK App::WindowProc(HWND window, UINT message, WPARAM wparam, LPARA
 
 LRESULT App::Handle(UINT message, WPARAM wparam, LPARAM lparam) noexcept {
     if (taskbarCreated_ && message == taskbarCreated_) {
-        AddTrayIcon();
+        if (trayRetry_.waiting()) {
+            if (trayRetry_.Attempt(GetTickCount64(), [this]() noexcept { return AddTrayIcon(); }) ==
+                TrayStartupRetry::Result::TimedOut) DestroyWindow(window_);
+        } else AddTrayIcon();
         return 0;
     }
     switch (message) {
+    case WM_TIMER:
+        if (wparam == TrayStartupRetry::kTimer && trayRetry_.waiting()) {
+            if (trayRetry_.Attempt(GetTickCount64(), [this]() noexcept { return AddTrayIcon(); }) ==
+                TrayStartupRetry::Result::TimedOut) DestroyWindow(window_);
+            return 0;
+        }
+        break;
     case kTrayMessage:
         HandleTrayMessage(wparam, lparam);
         return 0;
@@ -157,6 +172,7 @@ LRESULT App::Handle(UINT message, WPARAM wparam, LPARAM lparam) noexcept {
         return 0;
     case WM_DESTROY:
         operation_ = Operation::Exiting;
+        trayRetry_.Stop();
         hotkeys_.Stop();
         overlay_.Close();
         longEditor_.Close();
@@ -188,8 +204,11 @@ bool App::AddTrayIcon() noexcept {
     lstrcpynW(data.szTip, L"Picolet 截图工具", static_cast<int>(std::size(data.szTip)));
     trayAdded_ = Shell_NotifyIconW(NIM_ADD, &data) != FALSE;
     if (trayAdded_) {
+        trayRetry_.Stop();
         data.uVersion = NOTIFYICON_VERSION_4;
         trayVersion4_ = Shell_NotifyIconW(NIM_SETVERSION, &data) != FALSE;
+        // 重试成功及 Explorer 重建均走此处，但快捷键配置只加载一次。
+        if (!hotkeysStarted_) { hotkeys_.Start(window_); hotkeysStarted_ = true; }
     }
     return trayAdded_;
 }
@@ -225,7 +244,7 @@ void App::ShowTrayMenu(POINT anchor) noexcept {
                   binding.key && !hotkeys_.enabled() ? L"（未启用）" : L"");
     AppendMenuW(menu.get(), MF_STRING, TrayCapture, label);
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(menu.get(), MF_STRING, TraySettings, L"快捷键设置…");
+    AppendMenuW(menu.get(), MF_STRING, TraySettings, L"设置…");
     AppendMenuW(menu.get(), MF_STRING, TrayExit, L"退出");
 
     menuOpen_ = true;
@@ -245,10 +264,10 @@ void App::ShowTrayMenu(POINT anchor) noexcept {
 }
 
 void App::ShowSettings() noexcept {
-    operation_ = Operation::EditingHotkeys;
+    operation_ = Operation::EditingSettings;
     hotkeys_.Pause();
-    if (ShowShortcutDialog(instance_, window_, hotkeys_) == -1) {
-        ShowError(window_, L"无法打开快捷键设置。");
+    if (ShowSettingsDialog(instance_, window_, hotkeys_) == -1) {
+        ShowError(window_, L"无法打开设置。");
     }
     if (operation_ == Operation::Exiting) return;
     operation_ = Operation::Idle;
@@ -389,6 +408,7 @@ void App::EndCapture(const wchar_t* error) noexcept {
 // Unicode 图形程序入口。互斥体保持到进程退出，所有 COM 接口都在反初始化前释放。
 int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     using namespace picolet;
+    const bool autostart = IsAutostartCommandLine(GetCommandLineW());
     const KernelHandle instanceLock(CreateMutexW(nullptr, FALSE, kInstanceName));
     const DWORD lockStatus = GetLastError();
     if (!instanceLock) {
@@ -396,7 +416,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
         return 1;
     }
     if (lockStatus == ERROR_ALREADY_EXISTS) {
-        MessageBoxW(nullptr, L"Picolet 已在系统托盘运行。", kTitle, MB_OK | MB_ICONINFORMATION);
+        if (!autostart) MessageBoxW(nullptr, L"Picolet 已在系统托盘运行。", kTitle, MB_OK | MB_ICONINFORMATION);
         return 0;
     }
     const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
@@ -415,9 +435,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
     int result = 1;
     {
-        App app(instance);
+        App app(instance, autostart);
         if (app.Initialize()) result = app.Run();
-        else ShowError(nullptr, L"无法创建系统托盘入口。请确认 Windows 任务栏已启动。");
+        else if (!autostart) ShowError(nullptr, L"无法创建系统托盘入口。请确认 Windows 任务栏已启动。");
     }
     Gdiplus::GdiplusShutdown(graphicsToken);
     CoUninitialize();
