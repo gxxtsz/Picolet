@@ -1,0 +1,17 @@
+#pragma once
+
+// 由 CMake 在构建目录生成，版本只能通过根目录的 project(Picolet VERSION ...) 修改。
+// 界面使用项目的三段版本字符串；宽字符串可直接传给 Win32 的 Unicode 文本接口。
+#define PICOLET_VERSION_TEXT "@PROJECT_VERSION@"
+#define PICOLET_VERSION_WTEXT L"@PROJECT_VERSION@"
+
+// VERSIONINFO 的数值字段必须使用逗号分隔的四段整数；文本字段和清单使用相同的点分版本。
+// 最后一段固定为 0，与界面显示的主版本、次版本和修订版本一一对应。
+#define PICOLET_VERSION_NUMBERS @PROJECT_VERSION_MAJOR@, @PROJECT_VERSION_MINOR@, @PROJECT_VERSION_PATCH@, 0
+#define PICOLET_WINDOWS_VERSION_TEXT "@PICOLET_WINDOWS_VERSION@"
+
+// 资源编译器从当前构建目录读取已替换版本的清单；使用绝对路径避免回读源目录模板。
+#define PICOLET_MANIFEST_PATH "@PICOLET_GENERATED_DIR@/picolet.manifest"
+
+// 图标位于源码资源目录。资源编译器使用绝对路径，避免应用和测试的工作目录影响资源查找。
+#define PICOLET_ICON_PATH "@PICOLET_ICON_PATH@"

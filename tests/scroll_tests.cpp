@@ -1,9 +1,9 @@
-#include "scroll_stitcher.h"
-#include "capture_edit.h"
-#include "hotkeys.h"
-#include "image_view.h"
-#include "export.h"
-#include "win32.h"
+#include <picolet/scroll/scroll_stitcher.h>
+#include <picolet/edit/capture_edit.h>
+#include <picolet/system/hotkeys.h>
+#include <picolet/ui/image_view.h>
+#include <picolet/image/export.h>
+#include <picolet/win32/win32.h>
 #include <wincodec.h>
 #include <chrono>
 #include <filesystem>

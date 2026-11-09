@@ -1,8 +1,8 @@
-#include "capture_edit.h"
-#include "export.h"
-#include "hotkeys.h"
+#include <picolet/edit/capture_edit.h>
+#include <picolet/image/export.h>
+#include <picolet/system/hotkeys.h>
 #include "pin_shadow.h"
-#include "win32.h"
+#include <picolet/win32/win32.h>
 
 #include <wincodec.h>
 

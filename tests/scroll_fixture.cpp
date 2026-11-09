@@ -1,7 +1,7 @@
 // 原生交互验证夹具：文档、聊天和网页卡片共用可滚动正文与固定头尾。
 // 连续模式仅在夹具为前台时推进，截图框选阶段自动停住，恢复实时采集后继续运动。
-#include "capture_edit.h"
-#include "win32.h"
+#include <picolet/edit/capture_edit.h>
+#include <picolet/win32/win32.h>
 #include <windowsx.h>
 #include <algorithm>
 #include <cmath>

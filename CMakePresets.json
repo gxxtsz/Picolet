@@ -1,0 +1,80 @@
+{
+  "version": 2,
+  "cmakeMinimumRequired": { "major": 3, "minor": 20, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": { "BUILD_TESTING": "ON" }
+    },
+    {
+      "name": "msvc-base",
+      "hidden": true,
+      "inherits": "base",
+      "generator": "Visual Studio 17 2022",
+      "architecture": "x64"
+    },
+    {
+      "name": "mingw-base",
+      "hidden": true,
+      "inherits": "base",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "g++",
+        "CMAKE_RC_COMPILER": "windres",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "msvc-debug",
+      "displayName": "MSVC 调试版",
+      "description": "使用 Visual Studio 2022 x64 工具链，构建和测试预设选择 Debug。",
+      "inherits": "msvc-base"
+    },
+    {
+      "name": "msvc-release",
+      "displayName": "MSVC 发布版",
+      "description": "使用 Visual Studio 2022 x64 工具链，构建和测试预设选择 Release。",
+      "inherits": "msvc-base"
+    },
+    {
+      "name": "mingw-debug",
+      "displayName": "MinGW 调试版",
+      "description": "从 PATH 查找 MinGW-w64 与 Ninja，构建 Debug 并启用测试。",
+      "inherits": "mingw-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+    },
+    {
+      "name": "mingw-release",
+      "displayName": "MinGW 发布版",
+      "description": "从 PATH 查找 MinGW-w64 与 Ninja，构建 Release 并启用测试。",
+      "inherits": "mingw-base",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "msvc-debug", "configurePreset": "msvc-debug", "configuration": "Debug" },
+    { "name": "msvc-release", "configurePreset": "msvc-release", "configuration": "Release" },
+    { "name": "mingw-debug", "configurePreset": "mingw-debug" },
+    { "name": "mingw-release", "configurePreset": "mingw-release" }
+  ],
+  "testPresets": [
+    {
+      "name": "msvc-debug", "configurePreset": "msvc-debug", "configuration": "Debug",
+      "output": { "outputOnFailure": true }, "execution": { "noTestsAction": "error", "jobs": 1 }
+    },
+    {
+      "name": "msvc-release", "configurePreset": "msvc-release", "configuration": "Release",
+      "output": { "outputOnFailure": true }, "execution": { "noTestsAction": "error", "jobs": 1 }
+    },
+    {
+      "name": "mingw-debug", "configurePreset": "mingw-debug",
+      "output": { "outputOnFailure": true }, "execution": { "noTestsAction": "error", "jobs": 1 }
+    },
+    {
+      "name": "mingw-release", "configurePreset": "mingw-release",
+      "output": { "outputOnFailure": true }, "execution": { "noTestsAction": "error", "jobs": 1 }
+    }
+  ]
+}

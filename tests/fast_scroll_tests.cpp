@@ -1,4 +1,4 @@
-#include "capture_pipeline.h"
+#include <picolet/scroll/capture_pipeline.h>
 
 #include <algorithm>
 #include <atomic>

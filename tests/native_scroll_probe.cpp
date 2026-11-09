@@ -1,8 +1,8 @@
 // 在已打开的受控滚动夹具上记录真实 GDI 帧及匹配结果，用于排查显示缩放和渲染差异。
 // 本程序只读取夹具的客户区，不改变窗口、焦点或输入；输出写入可执行文件旁的验证目录。
-#include "capture_edit.h"
-#include "export.h"
-#include "capture_pipeline.h"
+#include <picolet/edit/capture_edit.h>
+#include <picolet/image/export.h>
+#include <picolet/scroll/capture_pipeline.h>
 #include <objbase.h>
 #include <filesystem>
 #include <iostream>

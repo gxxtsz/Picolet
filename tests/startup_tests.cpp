@@ -1,7 +1,7 @@
 // 测试进程将 HKCU 重定向到临时子键。真实 Run 项及用户快捷键配置始终不参与写入。
-#include "resources.h"
-#include "settings.h"
-#include "shortcut_dialog.h"
+#include <picolet/resources/resources.h>
+#include <picolet/system/settings.h>
+#include <picolet/ui/shortcut_dialog.h>
 
 #include <commctrl.h>
 #include <shellapi.h>

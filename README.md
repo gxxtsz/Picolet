@@ -130,20 +130,167 @@ Picolet 启动后驻留系统托盘。展开任务栏的隐藏图标区域，找
 
 ## 源码构建
 
-在 Windows x64 环境准备：
+构建环境必须为 Windows x64，源码使用 C++20。支持以下两套工具链：
 
-- CMake 3.20 或更高版本。
-- Visual Studio 2022 或对应的生成工具，安装“使用 C++ 的桌面开发”工作负载。
-- Windows SDK。
+- **MSVC**：Visual Studio 2022 或对应生成工具，安装“使用 C++ 的桌面开发”工作负载及 Windows SDK。VS2022 生成器需要 CMake 3.21 或更高版本。
+- **MinGW-w64**：支持 C++20 的 x64 工具链、Ninja 和 CMake 3.20 或更高版本。将 `g++`、`windres` 和 `ninja` 所在目录加入当前终端的 `PATH`。
 
-在项目根目录执行以下命令，生成 Release 版本：
+### 使用统一预设
+
+在项目根目录执行配置、构建和测试；三步使用同一预设名称：
+
+```powershell
+cmake --preset msvc-release
+cmake --build --preset msvc-release --parallel
+ctest --preset msvc-release
+```
+
+| 预设 | 工具链与配置 | 应用输出 |
+| --- | --- | --- |
+| `msvc-debug` | MSVC，Debug | `build/msvc-debug/Debug/Picolet.exe` |
+| `msvc-release` | MSVC，Release | `build/msvc-release/Release/Picolet.exe` |
+| `mingw-debug` | MinGW-w64，Debug | `build/mingw-debug/Picolet.exe` |
+| `mingw-release` | MinGW-w64，Release | `build/mingw-release/Picolet.exe` |
+
+四组预设均启用测试，并使用独立构建目录。测试预设串行执行，以免多个窗口测试争用桌面焦点。修改编译器或生成器时应使用新的构建目录。
+
+应用仍可单文件运行；MSVC 使用静态 CRT，MinGW 静态链接自身运行库。无需复制构建得到的模块静态库，Windows 系统 DLL 由操作系统提供。
+
+### 仅构建应用或指定模块
+
+只构建应用，或只构建滚动模块及其依赖：
+
+```powershell
+cmake --build --preset msvc-release --target Picolet --parallel
+cmake --build --preset mingw-debug --target picolet_scroll --parallel
+```
+
+构建命令使用真实目标名，如 `picolet_scroll`；`Picolet::scroll` 是 CMake 脚本中用于声明链接依赖的别名。
+
+发布时如需完全关闭测试目标，可使用独立目录。原有手动构建入口仍然有效：
 
 ```powershell
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=OFF
 cmake --build build --config Release --target Picolet
 ```
 
-输出文件为 `build\Release\Picolet.exe`，可单独复制到其他目录运行。以上命令关闭测试目标的生成，仅构建应用程序。
+上述命令输出 `build/Release/Picolet.exe`。也可在配置预设时指定 `-DBUILD_TESTING=OFF`；该构建目录随后不应再运行测试预设。
+
+### 个人工具路径
+
+共享的 `CMakePresets.json` 不记录个人安装目录。临时覆盖 Ninja 路径可使用：
+
+```powershell
+cmake --preset mingw-debug -DCMAKE_MAKE_PROGRAM="C:/工具目录/ninja.exe"
+```
+
+长期使用的路径放入已被 Git 忽略的 `CMakeUserPresets.json`。例如，复制以下内容并替换工具路径：
+
+```json
+{
+  "version": 2,
+  "configurePresets": [
+    {
+      "name": "local-mingw-debug",
+      "displayName": "本机 MinGW 调试版",
+      "inherits": "mingw-debug",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "C:/工具目录/mingw64/bin/g++.exe",
+        "CMAKE_RC_COMPILER": "C:/工具目录/mingw64/bin/windres.exe",
+        "CMAKE_MAKE_PROGRAM": "C:/工具目录/ninja.exe"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "local-mingw-debug", "configurePreset": "local-mingw-debug" }
+  ],
+  "testPresets": [
+    {
+      "name": "local-mingw-debug",
+      "inherits": "mingw-debug",
+      "configurePreset": "local-mingw-debug"
+    }
+  ]
+}
+```
+
+个人配置继承共享规则，输出到 `build/local-mingw-debug`。工具链自身需要的 DLL 目录仍须能被当前进程找到。
+
+## 模块与依赖管理
+
+项目采用单仓库、顶层统一配置、模块独立编译的组织方式，当前模块仅在仓库内部复用，不提供安装或外部包导出。
+
+```text
+Picolet/
+├── CMakeLists.txt          # 项目版本、平台检查、模块注册和测试开关
+├── CMakePresets.json       # 团队共享的配置、构建和测试入口
+├── cmake/                 # 目标编译策略和 Unicode 入口配置
+├── modules/
+│   ├── win32/             # Win32 基础封装，仅含头文件
+│   ├── image/             # 图像、屏幕采集和图片输出
+│   ├── scroll/            # 滚动拼接、帧跟踪、采集流水线
+│   ├── edit/              # 选区、标注和撤销重做
+│   ├── system/            # 快捷键、自启动和设置提交
+│   └── ui/                # 遮罩、编辑器、浮窗、工具栏和贴图
+├── app/                   # 入口、托盘和功能协调
+├── resources/             # 图标、资源编号、对话框和版本模板
+└── tests/                 # 自动测试及交互夹具
+```
+
+各业务模块包含自己的 `CMakeLists.txt`、`include/picolet/模块名/` 和 `src/`。公开头文件统一使用 `<picolet/模块名/头文件名.h>` 引用；实现目录不向其他模块公开。Win32 基础模块只有公开头文件。
+
+| 目标别名 | 公开模块依赖 | 职责 |
+| --- | --- | --- |
+| `Picolet::win32` | 无 | 句柄、COM、字体等基础封装，以及公共 Windows 编译定义 |
+| `Picolet::image` | `win32` | 像素存储、桌面及区域采集、绘制、PNG 和剪贴板输出 |
+| `Picolet::scroll` | `image`、`win32`、`Threads::Threads` | 拼接、帧跟踪、后台采集和诊断快照 |
+| `Picolet::edit` | `image`、`scroll`、`win32` | 选区调整、标注历史、长图标注迁移 |
+| `Picolet::system` | `win32` | 快捷键、自启动、设置提交和回滚 |
+| `Picolet::ui` | `image`、`scroll`、`edit`、`system`、`win32` | 截图和长图界面、工具栏、贴图与设置窗口 |
+| `Picolet::resources` | 无 | 资源编号和当前构建目录生成的版本头 |
+
+`win32` 和 `resources` 是接口目标，其余业务模块是静态库。应用与测试链接这些库，生产界面不在各个测试中重复编译。公开类定义需要的视口、绘制缓冲、工具栏头文件属于 UI 接口；贴图阴影保留为内部实现，仅向现有白盒测试开放私有包含路径。
+
+`edit` 使用滚动模块的 `SeedPlacement` 迁移标注，因此保留 `edit → scroll` 依赖。普通遮罩和长图编辑共同实现 `SelectionOverlay`，统一归属 UI 模块。模块化不改变这些类型、函数签名和线程约定。
+
+### 新模块接入约定
+
+1. 在 `modules` 下建立模块目录，把公开声明放入 `include/picolet/模块名/`，实现与内部头文件放入 `src/`，并为公开接口补充中文说明。
+2. 用 `add_library(picolet_模块名 STATIC ...)` 显式列出源码，建立 `Picolet::模块名` 别名，并调用 `picolet_configure_target()`。仅有头文件的模块使用 `INTERFACE` 目标，无需调用该函数。
+3. 通过 `target_include_directories()` 公开本模块的 `include` 目录；通过 `target_link_libraries()` 声明直接依赖。公开头文件需要的依赖使用 `PUBLIC`，实现细节使用 `PRIVATE`，仅提供给使用方的要求使用 `INTERFACE`。避免循环依赖和全局包含路径。
+4. 在顶层按依赖顺序调用 `add_subdirectory()`；应用和测试通过链接目标使用模块，不复制生产源码列表。
+
+公共编译策略位于 `cmake/PicoletOptions.cmake`：C++20、禁用语言扩展、私有警告选项及静态运行库保持一致。Windows 宏与内联基础函数需要的系统库由 `Picolet::win32` 传播。使用 `wmain` 或 `wWinMain` 的可执行目标另外调用 `picolet_use_unicode_entry()`，普通 `main` 测试不调用。
+
+新增需要图标、清单或设置对话框的可执行目标时，调用 `picolet_add_resources()`。资源直接嵌入最终可执行文件，不能只放进静态库。该函数同时处理各目标目录中的资源依赖、MinGW 资源编码和 MSVC 清单选项。
+
+项目版本只在顶层 `project(Picolet VERSION ...)` 修改。版本头与清单生成在当前构建目录的 `generated` 下，不写回源码，也不在不同工具链之间共享。
+
+## 开发测试
+
+完整构建预设后，运行同名测试预设即可执行现有 5 项自动测试：`picolet.image`、`picolet.scroll`、`picolet.fast_scroll`、`picolet.startup` 和 `picolet.paint`。部分测试覆盖多个模块，名称保持兼容。
+
+```powershell
+cmake --build --preset mingw-debug --parallel
+ctest --preset mingw-debug
+ctest --preset mingw-debug -R '^picolet\.fast_scroll$'
+```
+
+`picolet.startup` 使用独立注册表沙箱，并传入当前配置的应用路径验证重复启动；只构建 `picolet_startup_tests` 也会先构建应用。该测试保留 30 秒超时。
+
+默认构建还提供以下交互夹具，运行时选择同一构建目录中的程序：
+
+- `picolet_settings_fixture`：在隔离注册表中检查设置界面和保存流程。
+- `picolet_scroll_fixture`：提供文档、聊天和网页样式的滚动内容。
+- `picolet_capture_fixture`：配合滚动夹具验证实际采集、编辑、标注和贴图流程。
+
+`picolet_native_scroll_probe` 不参加默认构建和 CTest；需要先显式构建，再配合滚动夹具运行：
+
+```powershell
+cmake --build --preset mingw-debug --target picolet_native_scroll_probe
+```
+
+原生探针会在其可执行文件旁的 `native-capture` 目录输出采集结果。修改构建、资源或模块接口后，应分别验证 MSVC 和 MinGW 的 Debug、Release 构建，并运行对应测试预设。
 
 ## 许可证
 
