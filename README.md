@@ -7,7 +7,7 @@ Picolet 面向日常截图、内容标注和桌面对照场景，提供区域截
 ## 轻量化设计
 
 - **原生实现，依赖精简**：使用 C++20 和 Win32，直接调用 Windows 系统组件完成截图、绘图与图片编码。
-- **单文件运行**：运行单个 `Picolet.exe` 即可使用，无需安装额外运行时。
+- **单文件运行**：双击 Picolet 的可执行文件即可使用，无需安装额外运行时。
 - **托盘待命，操作直接**：平时驻留托盘，通过快捷键唤起截图，工具栏直接提供标注和输出操作。
 - **资源按需使用**：截图或长图编辑结束后释放本次会话的截图缓冲和采集资源；已打开的贴图保留到关闭时释放。
 
@@ -19,7 +19,7 @@ Picolet 面向日常截图、内容标注和桌面对照场景，提供区域截
 
 ## 快速开始
 
-1. 将 `Picolet.exe` 放到便于保留的位置，双击运行。程序图标会出现在系统托盘中；如果没有直接显示，可展开任务栏的隐藏图标区域。
+1. 将发布文件 `Picolet-<版本>.exe` 放到便于保留的位置，双击运行。程序图标会出现在系统托盘中。如果没有直接显示，可展开任务栏的隐藏图标区域。
 2. 按 `F1`，或左键单击托盘图标开始截图。也可以右键单击托盘图标，选择“截图”。
 3. 按住鼠标左键拖动，框选需要截取的区域。
 4. 按需使用工具栏添加形状、箭头、画笔、文字或马赛克。
@@ -117,7 +117,7 @@ Picolet 每次截图时检查各屏幕的 HDR 状态。跨屏截图分别处理�
 
 在“通用”中勾选“开机自启动”，点击“保存”。此设置作用于当前用户，登录后程序会驻留托盘；取消勾选并保存即可关闭自启动。
 
-开启自启动后请保留程序所在位置。如果移动了 `Picolet.exe`，从新位置运行程序，打开设置并在保持勾选的情况下再次保存，以更新启动路径。
+开启自启动后请保留可执行文件的路径。如果移动了文件，或升级后文件名变化，请从新路径运行程序，打开设置并在保持勾选的情况下再次保存，以更新启动路径。
 
 ## 常见问题
 
@@ -131,7 +131,7 @@ Picolet 启动后驻留系统托盘。展开任务栏的隐藏图标区域，找
 
 ### 已开启自启动，登录后却没有运行？
 
-确认 `Picolet.exe` 仍位于原来的位置，并检查 Windows 设置或任务管理器的“启动应用”中是否禁用了 Picolet。若已禁用，需要在 Windows 中重新启用；若移动过程序，按上面的步骤更新启动路径。
+确认自启动指向的可执行文件仍然存在，并检查 Windows 设置或任务管理器的“启动应用”中是否禁用了 Picolet。若已禁用，请在 Windows 中重新启用。若文件路径有变化，请按上面的步骤更新启动路径。
 
 ## 源码构建
 
@@ -153,9 +153,11 @@ ctest --preset msvc-release
 | 预设 | 工具链与配置 | 应用输出 |
 | --- | --- | --- |
 | `msvc-debug` | MSVC，Debug | `build/msvc-debug/Debug/Picolet.exe` |
-| `msvc-release` | MSVC，Release | `build/msvc-release/Release/Picolet.exe` |
+| `msvc-release` | MSVC，Release | `build/msvc-release/Release/Picolet-<版本>.exe` |
 | `mingw-debug` | MinGW-w64，Debug | `build/mingw-debug/Picolet.exe` |
-| `mingw-release` | MinGW-w64，Release | `build/mingw-release/Picolet.exe` |
+| `mingw-release` | MinGW-w64，Release | `build/mingw-release/Picolet-<版本>.exe` |
+
+发布文件名中的版本来自顶层 `CMakeLists.txt` 的项目版本，例如 `Picolet-1.0.0.exe`。
 
 四组预设均启用测试，并使用独立构建目录。测试预设串行执行，以免多个窗口测试争用桌面焦点。修改编译器或生成器时应使用新的构建目录。
 
@@ -179,7 +181,7 @@ cmake -S . -B build -G "Visual Studio 17 2022" -A x64 -DBUILD_TESTING=OFF
 cmake --build build --config Release --target Picolet
 ```
 
-上述命令输出 `build/Release/Picolet.exe`。也可在配置预设时指定 `-DBUILD_TESTING=OFF`；该构建目录随后不应再运行测试预设。
+上述命令输出 `build/Release/Picolet-<版本>.exe`。也可在配置预设时指定 `-DBUILD_TESTING=OFF`。该构建目录随后不应再运行测试预设。
 
 ### 个人工具路径
 

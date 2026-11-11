@@ -1,4 +1,6 @@
 add_executable(Picolet WIN32 app.cpp)
+# 发布版文件名使用顶层项目版本，与应用内显示和 Windows 文件版本共用版本来源。
+set_target_properties(Picolet PROPERTIES OUTPUT_NAME_RELEASE "Picolet-${PROJECT_VERSION}")
 picolet_configure_target(Picolet)
 picolet_use_unicode_entry(Picolet)
 picolet_add_resources(Picolet)
