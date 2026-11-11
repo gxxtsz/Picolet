@@ -10,8 +10,8 @@ namespace picolet {
 inline constexpr UINT kScrollAction = WM_APP + 5;
 enum class ScrollAction : WPARAM { Finish, Cancel };
 
-// 采集中的浮窗与镂空遮罩，所有状态只在应用 UI 线程访问。源窗口保持前台以接收真实滚轮。
-// 低级输入钩子只在本会话存续期间安装，回调只投递消息，关闭时先卸载再销毁窗口。
+// 采集期间，遮罩标记选区，透明输入窗口承接选区内的鼠标移动，原窗口保持前台以便滚动。
+// 低级输入钩子只在本会话存续期间安装，拦截会改动原窗口的输入，并投递采集命令。关闭时先卸载再销毁窗口。
 // 后台取帧与拼接由 ScrollCapturePipeline 完成。浮窗读取只读快照刷新预览，并将完成或取消通知应用。
 class LongCaptureSession {
 public:
@@ -39,11 +39,27 @@ private:
     friend struct PaintTestAccess;
     static LRESULT CALLBACK PanelProc(HWND, UINT, WPARAM, LPARAM) noexcept;
     static LRESULT CALLBACK MaskProc(HWND, UINT, WPARAM, LPARAM) noexcept;
+    static LRESULT CALLBACK InputProc(HWND, UINT, WPARAM, LPARAM) noexcept;
     static LRESULT CALLBACK MouseHook(int, WPARAM, LPARAM) noexcept;
     static LRESULT CALLBACK KeyboardHook(int, WPARAM, LPARAM) noexcept;
+    // 返回 true 表示截获该事件。鼠标保护选区内的输入窗口与原窗口，键盘只保护当前前台原窗口。
+    bool FilterMouse(WPARAM message, const MSLLHOOKSTRUCT& event, HWND hitWindow, UINT modifiers) noexcept;
+    bool FilterKey(WPARAM message, Hotkey key, bool targetForeground) noexcept;
     LRESULT Handle(UINT, WPARAM, LPARAM) noexcept;
     void Tick() noexcept;
+    // 手动滚轮输入会接管自动滚动，并在新画面尚未确认时提供最新方向。
+    void HandleManualWheel(SHORT delta) noexcept;
+    // 输入窗口可见时放在浮窗下方，让覆盖选区的浮窗按钮也能被点击。
+    void ShowInputWindow(bool visible) noexcept;
+    // 将纵向滚轮发送到原窗口中光标位置对应的控件，保留触摸板产生的细粒度滚动量。
+    bool ForwardWheel(POINT point, SHORT delta) noexcept;
+    // Chromium 在处理滚轮时重新命中屏幕坐标。同步派发期间只开放滚轮坐标处的一个像素，派发结束后恢复输入区。
+    HRESULT DispatchChromiumWheel(POINT point, SHORT delta) noexcept;
     void ToggleAutomatic() noexcept;
+    // 从手动滚轮与已确认画面中选取时间最近的方向，也支持只产生画面位移的触摸板。
+    ScrollDirection RecentDirection() const noexcept;
+    // 等待当前滚轮指令的采集反馈，初次方向未知且连续无位移时尝试向上，已确定方向后到边界即暂停。
+    void CheckAutomaticResponse(ULONGLONG now) noexcept;
     void Pause(const wchar_t* status) noexcept;
     void PostAction(ScrollAction action) noexcept;
     void PublishAction(ScrollAction action) noexcept;
@@ -62,9 +78,8 @@ private:
     bool TargetForeground() const noexcept;
 
     inline static LongCaptureSession* active_ = nullptr;
-    HWND owner_ = nullptr, panel_ = nullptr, mask_ = nullptr, target_ = nullptr;
-    HWND directionUp_ = nullptr, directionDown_ = nullptr, autoButton_ = nullptr;
-    HWND finishButton_ = nullptr, cancelButton_ = nullptr;
+    HWND owner_ = nullptr, panel_ = nullptr, mask_ = nullptr, inputWindow_ = nullptr, target_ = nullptr;
+    HWND autoButton_ = nullptr, finishButton_ = nullptr, cancelButton_ = nullptr;
     HHOOK mouseHook_ = nullptr, keyboardHook_ = nullptr;
     FontHandle font_;
     PaintBuffer paintBuffer_;
@@ -75,11 +90,17 @@ private:
     UINT dpi_ = USER_DEFAULT_SCREEN_DPI;
     UINT targetDpi_ = USER_DEFAULT_SCREEN_DPI;
     ULONGLONG lastAuto_ = 0, commandAt_ = 0;
+    ULONGLONG lastWheelAt_ = 0;
+    ScrollDirection wheelDirection_ = ScrollDirection::Unknown;
+    // 未知时先向下试，确认方向或改试向上后保持本轮方向，直到用户暂停。
+    ScrollDirection autoDirection_ = ScrollDirection::Unknown;
     std::uint64_t commandMotion_ = 0, commandProcessed_ = 0;
     int still_ = 0;
-    bool automatic_ = false, upward_ = false, pendingAuto_ = false, pending_ = false;
+    bool automatic_ = false, pendingAuto_ = false, pending_ = false;
     bool blocked_ = false, excluded_ = false;
     bool finishing_ = false;
+    bool chromiumTarget_ = false;
+    // 记住已拦截的按下事件，鼠标移出或前台切换后仍成对拦截同一次按压的抬起事件。
     bool held_[256]{};
     wchar_t status_[180]{};
 };

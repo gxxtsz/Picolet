@@ -18,6 +18,8 @@ struct ScrollTrackingUpdate {
     ScrollTrackingState state = ScrollTrackingState::Capturing;
     StitchUpdate stitch;
     std::uint64_t sequence = 0, desktopTick = 0, motion = 0;
+    // 本次更新中最后一次确认位移的画面采集时刻，与 GetTickCount64 使用同一时钟。
+    std::uint64_t motionTick = 0;
 };
 
 // 单线程追踪器：可靠候选先缓存一帧，得到下一张画面的运动补偿确认后再提交新增条带。

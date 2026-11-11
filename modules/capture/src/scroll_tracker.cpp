@@ -28,6 +28,7 @@ HRESULT ScrollFrameTracker::Apply(Pending& pending, ScrollTrackingUpdate& update
     if (FAILED(hr)) return hr;
     if (change.status == StitchStatus::Extended || change.status == StitchStatus::Revisited) {
         update.stitch = change;
+        update.motionTick = pending.frame.desktopTick;
         ++motion_;
     }
     update.motion = motion_;

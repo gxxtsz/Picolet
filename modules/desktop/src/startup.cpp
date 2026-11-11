@@ -57,6 +57,27 @@ bool IsAutostartCommandLine(const wchar_t* commandLine) noexcept {
     return found;
 }
 
+HRESULT AcquireInstanceLock(const wchar_t* name, bool waitForPrevious, KernelHandle& lock) noexcept {
+    constexpr ULONGLONG waitLimit = 8000;
+    const auto started = GetTickCount64();
+    for (;;) {
+        SetLastError(ERROR_SUCCESS);
+        KernelHandle candidate(CreateMutexExW(nullptr, name, 0, SYNCHRONIZE));
+        const DWORD error = GetLastError();
+        if (candidate && error != ERROR_ALREADY_EXISTS) {
+            lock.reset(candidate.release());
+            return S_OK;
+        }
+        // 使用另一个管理员账户接手时，旧互斥体可能拒绝访问。等旧进程退出后即可重新创建。
+        if (!candidate && error != ERROR_ACCESS_DENIED) return LastErrorResult();
+        if (!waitForPrevious) return S_FALSE;
+        // 每次先释放本次打开的句柄，旧实例关闭最后一个句柄时，名称才能从系统中移除。
+        candidate.reset();
+        if (GetTickCount64() - started >= waitLimit) return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+        Sleep(50);
+    }
+}
+
 HRESULT StartupRegistration::Read(StartupValue& value) const noexcept {
     HKEY raw = nullptr;
     LSTATUS status = RegOpenKeyExW(root_, subkey_, 0, KEY_QUERY_VALUE, &raw);

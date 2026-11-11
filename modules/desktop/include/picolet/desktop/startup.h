@@ -32,6 +32,10 @@ HRESULT BuildStartupCommand(std::wstring_view executable, std::wstring& command)
 // 参数大小写敏感，只有完整的 --autostart 才生效；拆分失败按普通启动处理。
 bool IsAutostartCommandLine(const wchar_t* commandLine) noexcept;
 
+// 用具名互斥体的存续期保证单实例。首次创建成功返回 S_OK，并把句柄交给调用方保持到进程退出。
+// 普通重复启动返回 S_FALSE。已获得管理员权限的接手进程可等待旧实例退出，超时返回 ERROR_TIMEOUT 对应的 HRESULT。
+HRESULT AcquireInstanceLock(const wchar_t* name, bool waitForPrevious, KernelHandle& lock) noexcept;
+
 // 当前用户启动项的读写器，仅管理 subkey 下名为 Picolet 的一个值，不删除整个键。
 // root、subkey 均为借用：调用者负责使句柄和字符串活到本对象最后一次调用之后；本对象不关闭 root。
 // 默认定位真实 HKCU Run；测试可传临时根键，确保不读写用户的真实自启动配置。

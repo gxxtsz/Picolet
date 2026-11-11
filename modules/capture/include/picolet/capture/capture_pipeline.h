@@ -65,6 +65,9 @@ struct CapturePipelineStats {
 // 预览是不可变共享图片，界面持有快照时后台不会覆盖其缓冲。编号用于拒绝过期会话消息。
 struct CapturePipelineSnapshot {
     std::uint64_t session = 0, revision = 0, lastFrameTick = 0;
+    // 保留最近一次由像素确认的滚动方向及采集时刻，静止帧到达后仍可用于恢复自动滚动。
+    std::uint64_t lastMotionTick = 0;
+    ScrollDirection lastMotionDirection = ScrollDirection::Unknown;
     ScrollTrackingState tracking = ScrollTrackingState::Capturing;
     StitchStatus stitchStatus = StitchStatus::Unchanged;
     CaptureSourceState source = CaptureSourceState::Ready;

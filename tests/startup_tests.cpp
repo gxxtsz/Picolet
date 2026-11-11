@@ -12,6 +12,7 @@
 #include <functional>
 #include <iostream>
 #include <stdexcept>
+#include <thread>
 
 namespace {
 using namespace picolet;
@@ -456,6 +457,32 @@ void TestDialogs(HKEY root) {
     DestroyWindow(owner);
 }
 
+void TestInstanceHandoff() {
+    // 使用独立名称验证交接。旧实例释放前，新进程只能等待，普通启动仍立即报告重复。
+    const std::wstring name = L"Local\\Picolet.Test.Handoff." + std::to_wstring(GetCurrentProcessId());
+    KernelHandle previous, next;
+    Check(AcquireInstanceLock(name.c_str(), false, previous) == S_OK && previous, "无法取得初始实例句柄");
+    Check(AcquireInstanceLock(name.c_str(), false, next) == S_FALSE && !next, "普通启动未拒绝重复实例");
+
+    const KernelHandle started(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    const KernelHandle finished(CreateEventW(nullptr, TRUE, FALSE, nullptr));
+    Check(started && finished, "无法创建交接测试事件");
+    HRESULT result = E_PENDING;
+    std::jthread replacement([&] {
+        SetEvent(started.get());
+        result = AcquireInstanceLock(name.c_str(), true, next);
+        SetEvent(finished.get());
+    });
+    const auto began = WaitForSingleObject(started.get(), 2000);
+    const auto beforeExit = WaitForSingleObject(finished.get(), 100);
+    previous.reset();
+    const auto afterExit = WaitForSingleObject(finished.get(), 3000);
+    replacement.join();
+    Check(began == WAIT_OBJECT_0 && beforeExit == WAIT_TIMEOUT, "接手进程未等待旧实例退出");
+    Check(afterExit == WAIT_OBJECT_0 && result == S_OK && next, "旧实例退出后未取得实例句柄");
+    Check(AcquireInstanceLock(name.c_str(), false, previous) == S_FALSE && !previous, "接手后允许启动第二个实例");
+}
+
 void TestDuplicateProcess(const wchar_t* executable) {
     // 即使用户未运行 Picolet，也用现有实例互斥体模拟已运行状态；子进程应在创建任何界面前退出。
     const KernelHandle instance(CreateMutexW(nullptr, FALSE, L"Local\\Picolet.Screenshot.Instance"));
@@ -501,6 +528,7 @@ int RunStartupVerification(int argc, wchar_t** argv) {
             TestPermissionFailures(sandbox.root());
             TestTrayRetry();
             TestDialogs(sandbox.root());
+            TestInstanceHandoff();
             if (argc == 2) TestDuplicateProcess(argv[1]);
         }
         sandbox.CheckRealUnchanged();

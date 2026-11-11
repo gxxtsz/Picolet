@@ -26,20 +26,32 @@ namespace {
 constexpr wchar_t kTitle[] = L"Picolet";
 constexpr wchar_t kControllerClass[] = L"Picolet.Tray";
 constexpr wchar_t kInstanceName[] = L"Local\\Picolet.Screenshot.Instance";
+constexpr wchar_t kElevatedRestartArgument[] = L"--elevated-restart";
 constexpr UINT kTrayIcon = 1;
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kCaptureRequest = WM_APP + 4;
-enum TrayCommand : UINT { TrayCapture = 2001, TraySettings, TrayExit };
-enum class Operation { Idle, PendingCapture, Selecting, Scrolling, EditingLong, EditingSettings, Output, Exiting };
+enum TrayCommand : UINT { TrayCapture = 2001, TraySettings, TrayExit, TrayRestartElevated };
+enum class Operation { Idle, PendingCapture, Selecting, Scrolling, EditingLong, EditingSettings, Output, Restarting, Exiting };
 
 void ShowError(HWND owner, const wchar_t* message) noexcept {
     MessageBoxW(owner, message, kTitle, MB_OK | MB_ICONERROR);
 }
 
+// 查询当前进程正在使用的令牌，区分管理员账户的普通进程和已获得管理员权限的进程。
+bool IsProcessElevated() noexcept {
+    HANDLE raw = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &raw)) return false;
+    const KernelHandle token(raw);
+    TOKEN_ELEVATION elevation{};
+    DWORD size = 0;
+    return GetTokenInformation(token.get(), TokenElevation, &elevation, sizeof(elevation), &size) && elevation.TokenIsElevated;
+}
+
 // 隐藏的顶层窗口统一接收托盘、热键与显示变化。冻结帧、会话和输出在同一线程串行管理。
 class App {
 public:
-    explicit App(HINSTANCE instance, bool autostart) noexcept : instance_(instance), autostart_(autostart) {}
+    explicit App(HINSTANCE instance, bool autostart, bool elevated) noexcept
+        : instance_(instance), autostart_(autostart), elevated_(elevated) {}
     ~App() { if (window_) DestroyWindow(window_); }
 
     bool Initialize() noexcept;
@@ -54,6 +66,8 @@ private:
     void HandleTrayMessage(WPARAM wparam, LPARAM lparam) noexcept;
     void ShowTrayMenu(POINT anchor) noexcept;
     void ShowSettings() noexcept;
+    // 由用户从托盘触发。系统确认并启动新进程后退出当前实例，取消或失败时恢复托盘操作和快捷键。
+    void RestartElevated() noexcept;
 
     void RequestCapture() noexcept;
     void StartCapture() noexcept;
@@ -71,6 +85,7 @@ private:
     bool trayAdded_ = false;
     bool trayVersion4_ = false;
     bool autostart_ = false;
+    bool elevated_ = false;
     bool hotkeysStarted_ = false;
     TrayStartupRetry trayRetry_;
     bool menuOpen_ = false;
@@ -204,7 +219,8 @@ bool App::AddTrayIcon() noexcept {
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     data.uCallbackMessage = kTrayMessage;
     data.hIcon = icon_;
-    lstrcpynW(data.szTip, L"Picolet 截图工具", static_cast<int>(std::size(data.szTip)));
+    lstrcpynW(data.szTip, elevated_ ? L"Picolet 截图工具（管理员）" : L"Picolet 截图工具",
+              static_cast<int>(std::size(data.szTip)));
     trayAdded_ = Shell_NotifyIconW(NIM_ADD, &data) != FALSE;
     if (trayAdded_) {
         trayRetry_.Stop();
@@ -248,6 +264,7 @@ void App::ShowTrayMenu(POINT anchor) noexcept {
     AppendMenuW(menu.get(), MF_STRING, TrayCapture, label);
     AppendMenuW(menu.get(), MF_SEPARATOR, 0, nullptr);
     AppendMenuW(menu.get(), MF_STRING, TraySettings, L"设置…");
+    if (!elevated_) AppendMenuW(menu.get(), MF_STRING, TrayRestartElevated, L"以管理员身份重新启动…");
     AppendMenuW(menu.get(), MF_STRING, TrayExit, L"退出");
 
     menuOpen_ = true;
@@ -261,9 +278,39 @@ void App::ShowTrayMenu(POINT anchor) noexcept {
     switch (command) {
     case TrayCapture: RequestCapture(); break;
     case TraySettings: ShowSettings(); break;
+    case TrayRestartElevated: RestartElevated(); break;
     case TrayExit: DestroyWindow(window_); break;
     default: hotkeys_.Resume(); break;
     }
+}
+
+void App::RestartElevated() noexcept {
+    operation_ = Operation::Restarting;
+    std::wstring executable;
+    HRESULT result = CurrentExecutablePath(executable);
+    if (SUCCEEDED(result)) {
+        SHELLEXECUTEINFOW launch{};
+        launch.cbSize = sizeof(launch);
+        launch.fMask = SEE_MASK_NOASYNC | SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
+        launch.hwnd = window_;
+        launch.lpVerb = L"runas";
+        launch.lpFile = executable.c_str();
+        launch.lpParameters = kElevatedRestartArgument;
+        launch.nShow = SW_SHOWNORMAL;
+        // Windows 负责用户账户控制确认。只有新进程启动后才销毁当前托盘窗口并释放单实例句柄。
+        SetLastError(ERROR_SUCCESS);
+        result = ShellExecuteExW(&launch) ? S_OK : LastErrorResult();
+        const KernelHandle process(launch.hProcess);
+        if (SUCCEEDED(result) && process) {
+            if (window_) DestroyWindow(window_);
+            return;
+        }
+    }
+    if (operation_ == Operation::Exiting) return;
+    if (result != HRESULT_FROM_WIN32(ERROR_CANCELLED)) ShowError(window_, L"无法以管理员身份重新启动 Picolet。");
+    if (operation_ == Operation::Exiting) return;
+    operation_ = Operation::Idle;
+    hotkeys_.Resume();
 }
 
 void App::ShowSettings() noexcept {
@@ -416,18 +463,22 @@ void App::EndCapture(const wchar_t* error) noexcept {
 }  // namespace picolet
 
 // Unicode 图形程序入口。互斥体保持到进程退出，所有 COM 接口都在反初始化前释放。
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR commandLine, int) {
     using namespace picolet;
     const bool autostart = IsAutostartCommandLine(GetCommandLineW());
-    const KernelHandle instanceLock(CreateMutexW(nullptr, FALSE, kInstanceName));
-    const DWORD lockStatus = GetLastError();
-    if (!instanceLock) {
-        ShowError(nullptr, L"无法启动 Picolet。");
-        return 1;
-    }
-    if (lockStatus == ERROR_ALREADY_EXISTS) {
+    const bool elevated = IsProcessElevated();
+    const bool restart = elevated && commandLine && std::wstring_view(commandLine) == kElevatedRestartArgument;
+    KernelHandle instanceLock;
+    const auto locked = AcquireInstanceLock(kInstanceName, restart, instanceLock);
+    if (locked == S_FALSE) {
         if (!autostart) MessageBoxW(nullptr, L"Picolet 已在系统托盘运行。", kTitle, MB_OK | MB_ICONINFORMATION);
         return 0;
+    }
+    if (FAILED(locked)) {
+        ShowError(nullptr, locked == HRESULT_FROM_WIN32(ERROR_TIMEOUT)
+            ? L"等待原有 Picolet 退出超时，请从托盘退出原实例后重试。"
+            : L"无法启动 Picolet。");
+        return 1;
     }
     const HRESULT initialized = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     if (FAILED(initialized)) {
@@ -445,7 +496,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
     }
     int result = 1;
     {
-        App app(instance, autostart);
+        App app(instance, autostart, elevated);
         if (app.Initialize()) result = app.Run();
         else if (!autostart) ShowError(nullptr, L"无法创建系统托盘入口。请确认 Windows 任务栏已启动。");
     }

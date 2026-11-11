@@ -6,6 +6,7 @@
 
 #include <objbase.h>
 #include <gdiplus.h>
+#include <windowsx.h>
 #include <algorithm>
 #include <iostream>
 #include <stdexcept>
@@ -310,7 +311,7 @@ struct PaintTestAccess {
         Check(window != nullptr, "创建隐藏预览浮窗失败");
         panel.font_.reset(CreateUiFont(96));
         const auto button = [&] { return CreateWindowExW(0, L"BUTTON", L"自动滚动", WS_CHILD, 0, 0, 1, 1, window, nullptr, instance, nullptr); };
-        panel.directionDown_ = button(); panel.directionUp_ = button(); panel.autoButton_ = button();
+        panel.autoButton_ = button();
         panel.finishButton_ = button(); panel.cancelButton_ = button(); panel.Layout();
         ShowWindow(window, SW_SHOWNOACTIVATE);
         auto image = std::make_shared<Image>(); Check(SUCCEEDED(image->Resize(60, 200)), "创建预览失败");
@@ -336,6 +337,102 @@ struct PaintTestAccess {
         panel.Pause(L"暂停"); Check(!Dirty(window) && !Dirty(panel.autoButton_), "重复暂停刷新了相同文字");
         panel.Close();
     }
+
+    static void TestAutomaticDirection() {
+        // 通过浮窗的生产方法处理滚轮和采集反馈，使用固定时钟与快照，避免向桌面发送输入。
+        LongCaptureSession panel;
+        Check(panel.RecentDirection() == ScrollDirection::Unknown, "新会话已有方向记录");
+        panel.snapshot_.lastMotionDirection = ScrollDirection::Up;
+        Check(panel.RecentDirection() == ScrollDirection::Up, "仅有画面位移时未能识别向上滚动");
+        panel.automatic_ = panel.pendingAuto_ = true;
+        panel.HandleManualWheel(-WHEEL_DELTA);
+        Check(!panel.automatic_ && !panel.pendingAuto_ && panel.RecentDirection() == ScrollDirection::Down,
+              "手动滚轮未暂停自动滚动或未更新最近方向");
+        panel.snapshot_.lastMotionTick = panel.lastWheelAt_ + 1;
+        Check(panel.RecentDirection() == ScrollDirection::Up, "较新的实际位移未更新滚动方向");
+
+        LongCaptureSession probe;
+        probe.automatic_ = probe.pendingAuto_ = true;
+        probe.commandAt_ = 1000;
+        probe.still_ = 2;
+        probe.CheckAutomaticResponse(2799);
+        Check(probe.pendingAuto_ && probe.autoDirection_ == ScrollDirection::Unknown, "等待静止画面的时间不足");
+        probe.CheckAutomaticResponse(2800);
+        Check(probe.automatic_ && !probe.pendingAuto_ && probe.autoDirection_ == ScrollDirection::Up && probe.still_ == 0,
+              "首次向下滚动无位移时未尝试向上");
+        probe.pendingAuto_ = true;
+        probe.still_ = 2;
+        probe.CheckAutomaticResponse(2800);
+        Check(!probe.automatic_ && probe.autoDirection_ == ScrollDirection::Up, "上下均无位移时未暂停");
+
+        LongCaptureSession moving;
+        moving.automatic_ = moving.pendingAuto_ = true;
+        moving.commandAt_ = 1000;
+        moving.snapshot_.stats.processed = moving.snapshot_.stats.motion = 1;
+        moving.snapshot_.lastFrameTick = 1180;
+        moving.CheckAutomaticResponse(1180);
+        Check(moving.autoDirection_ == ScrollDirection::Down, "向下滚动产生位移后未锁定方向");
+        moving.pendingAuto_ = true;
+        moving.commandMotion_ = 1;
+        moving.still_ = 2;
+        moving.CheckAutomaticResponse(1180);
+        Check(!moving.automatic_ && moving.autoDirection_ == ScrollDirection::Down, "向下滚动到边界后自动换向");
+    }
+
+    static void TestCaptureInputProtection(HINSTANCE instance) {
+        // 隐藏窗口仅用作命中结果。通过实际过滤入口验证事件去向，无需安装钩子或向桌面发送输入。
+        LongCaptureSession panel;
+        const HWND window = CreateWindowExW(WS_EX_NOACTIVATE, L"Picolet.LongCapture", L"输入保护测试", WS_POPUP,
+            -20000, -20000, 238, 590, nullptr, nullptr, instance, &panel);
+        const UniqueHandle<HWND, DestroyWindow> target(CreateWindowExW(WS_EX_NOACTIVATE, L"STATIC", L"原窗口", WS_POPUP,
+            -20000, -20000, 100, 100, nullptr, nullptr, instance, nullptr));
+        panel.inputWindow_ = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_NOREDIRECTIONBITMAP, L"Picolet.LongCaptureInput", L"选区输入窗口", WS_POPUP,
+            -20000, -20000, 100, 100, nullptr, nullptr, instance, &panel);
+        Check(window && target && panel.inputWindow_, "创建输入保护测试窗口失败");
+        panel.area_ = {0, 0, 100, 100};
+        panel.target_ = target.get();
+        MSLLHOOKSTRUCT pointer{};
+        pointer.pt = {30, 30};
+        Check(panel.FilterMouse(WM_LBUTTONDOWN, pointer, panel.inputWindow_, 0), "选区左键按下传到了原窗口");
+        pointer.pt = {110, 30};
+        Check(panel.FilterMouse(WM_LBUTTONUP, pointer, window, 0), "移出选区后漏放了已拦截的鼠标抬起");
+        pointer.pt = {30, 30};
+        Check(!panel.FilterMouse(WM_LBUTTONDOWN, pointer, window, 0) &&
+              !panel.FilterMouse(WM_LBUTTONUP, pointer, target.get(), 0), "覆盖选区的浮窗按压被拦截或无法释放");
+        pointer.mouseData = MAKEWPARAM(0, XBUTTON1);
+        Check(panel.FilterMouse(WM_XBUTTONDOWN, pointer, target.get(), 0) &&
+              panel.FilterMouse(WM_XBUTTONUP, pointer, target.get(), 0), "鼠标侧键仍能操作原窗口");
+        pointer.mouseData = MAKEWPARAM(0, WHEEL_DELTA);
+        Check(!panel.FilterMouse(WM_MOUSEWHEEL, pointer, panel.inputWindow_, 0) &&
+              panel.FilterMouse(WM_MOUSEWHEEL, pointer, panel.inputWindow_, MOD_CONTROL) &&
+              panel.FilterMouse(WM_MOUSEHWHEEL, pointer, panel.inputWindow_, 0), "普通滚动未放行或缩放、横向滚动未拦截");
+
+        Check(panel.FilterKey(WM_KEYDOWN, {0, 'A'}, true) && panel.FilterKey(WM_KEYUP, {0, 'A'}, false),
+              "原窗口仍可接收输入或切换前台后漏放抬键");
+        Check(!panel.FilterKey(WM_KEYDOWN, {0, 'A'}, false) &&
+              !panel.FilterKey(WM_SYSKEYDOWN, {MOD_ALT, VK_TAB}, true), "非原窗口输入或切换窗口键被拦截");
+        Check(panel.FilterKey(WM_KEYDOWN, {0, VK_RETURN}, true) &&
+              panel.FilterKey(WM_KEYDOWN, {0, VK_RETURN}, true) &&
+              panel.FilterKey(WM_KEYUP, {0, VK_RETURN}, true), "完成键未由采集会话接收");
+        MSG command{};
+        Check(PeekMessageW(&command, window, WM_APP, 0xBFFF, PM_REMOVE) &&
+              command.wParam == static_cast<WPARAM>(ScrollAction::Finish) &&
+              !PeekMessageW(&command, window, WM_APP, 0xBFFF, PM_REMOVE), "按住完成键时未触发或重复触发了采集命令");
+
+        // 源窗口含两层子控件，验证转发保留负屏幕坐标和小于一格的滚动量。
+        const HWND container = CreateWindowExW(0, L"STATIC", nullptr, WS_CHILD | WS_VISIBLE,
+            10, 10, 80, 80, target.get(), nullptr, instance, nullptr);
+        const HWND list = CreateWindowExW(0, L"LISTBOX", nullptr, WS_CHILD | WS_VISIBLE,
+            10, 10, 60, 60, container, nullptr, instance, nullptr);
+        Check(container && list, "创建嵌套滚动控件失败");
+        ShowWindow(target.get(), SW_SHOWNOACTIVATE);
+        POINT point{30, 35};
+        ClientToScreen(target.get(), &point);
+        MSG wheel{};
+        Check(panel.ForwardWheel(point, -36) && PeekMessageW(&wheel, list, WM_MOUSEWHEEL, WM_MOUSEWHEEL, PM_REMOVE) &&
+              GET_WHEEL_DELTA_WPARAM(wheel.wParam) == -36 && GET_X_LPARAM(wheel.lParam) == point.x &&
+              GET_Y_LPARAM(wheel.lParam) == point.y, "滚轮未送达命中的子控件或转发参数错误");
+    }
 };
 }
 
@@ -350,6 +447,7 @@ int main() {
         Check(SelectionOverlay::Register(instance, nullptr) && LongCaptureSession::Register(instance, nullptr), "注册绘制测试窗口失败");
         TestBuffer(); PaintTestAccess::TestToolbar(instance); PaintTestAccess::TestEditor(instance);
         PaintTestAccess::TestSelection(instance); PaintTestAccess::TestPanel(instance);
+        PaintTestAccess::TestAutomaticDirection(); PaintTestAccess::TestCaptureInputProtection(instance);
         std::cout << "缓冲、裁剪、局部重绘和缩略图缓存测试通过。\n";
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; result = 1; }
     Gdiplus::GdiplusShutdown(token);

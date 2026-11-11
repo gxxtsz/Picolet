@@ -310,6 +310,11 @@ void ScrollCapturePipeline::Publish(const ScrollTrackingUpdate& update, bool for
     snapshot_.tracking = update.state; snapshot_.stitchStatus = update.stitch.status; snapshot_.failure = update.stitch.failure;
     snapshot_.height = tracker_.image().height(); snapshot_.viewport = tracker_.image().viewport();
     if (update.desktopTick) snapshot_.lastFrameTick = update.desktopTick;
+    // 使用拼接确认的有符号位移记录方向，包括回到已拼接区域的移动。
+    if (update.motion > snapshot_.stats.motion) {
+        snapshot_.lastMotionDirection = update.stitch.displacement < 0 ? ScrollDirection::Up : ScrollDirection::Down;
+        snapshot_.lastMotionTick = update.motionTick;
+    }
     snapshot_.stats.motion = update.motion;
     if (preview) {
         snapshot_.preview = std::move(preview);

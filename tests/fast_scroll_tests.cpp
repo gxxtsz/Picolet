@@ -250,6 +250,8 @@ void TestPipeline() {
     pipeline.RequestFinish();
     const auto snapshot = WaitFor(pipeline, [](const auto& value) { return value.finished; });
     Check(SUCCEEDED(snapshot.error) && snapshot.stats.peakQueued <= 12 && snapshot.preview, "后台状态或预览错误");
+    Check(snapshot.lastMotionDirection == ScrollDirection::Up && snapshot.lastMotionTick > 0,
+          "静止帧覆盖了最近确认的反向位移");
     Image result; SeedPlacement placement;
     Check(pipeline.Result(result, placement) == S_OK, "异步结果未准备好");
     Verify(result, -130, 350 + 410);
