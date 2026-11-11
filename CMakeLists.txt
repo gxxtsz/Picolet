@@ -15,14 +15,10 @@ include(cmake/PicoletOptions.cmake)
 find_package(Threads REQUIRED)
 include(CTest)
 
-# 按依赖顺序注册模块。各模块只维护自己的源码、公开接口和直接依赖。
+# 先提供资源头，再按依赖顺序注册两个业务库。桌面模块消费采集结果，应用负责协调两者。
 add_subdirectory(resources)
-add_subdirectory(modules/win32)
-add_subdirectory(modules/image)
-add_subdirectory(modules/scroll)
-add_subdirectory(modules/edit)
-add_subdirectory(modules/system)
-add_subdirectory(modules/ui)
+add_subdirectory(modules/capture)
+add_subdirectory(modules/desktop)
 add_subdirectory(app)
 if(BUILD_TESTING)
     add_subdirectory(tests)

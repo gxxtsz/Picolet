@@ -1,12 +1,15 @@
-#include <picolet/image/export.h>
-#include <picolet/system/hotkeys.h>
-#include <picolet/ui/overlay.h>
-#include <picolet/ui/long_capture.h>
-#include <picolet/ui/pins.h>
+#include <picolet/capture/capture_edit.h>
+#include <picolet/capture/image.h>
+#include <picolet/capture/scroll_stitcher.h>
+#include <picolet/desktop/export.h>
+#include <picolet/desktop/hotkeys.h>
+#include <picolet/desktop/long_capture.h>
+#include <picolet/desktop/overlay.h>
+#include <picolet/desktop/pins.h>
+#include <picolet/desktop/shortcut_dialog.h>
+#include <picolet/desktop/startup.h>
 #include <picolet/resources/resources.h>
-#include <picolet/ui/shortcut_dialog.h>
-#include <picolet/system/startup.h>
-#include <picolet/win32/win32.h>
+#include <picolet/win32.h>
 
 #include <commctrl.h>
 #include <dwmapi.h>
@@ -309,6 +312,8 @@ void App::HandleOverlayAction(OverlayAction action) noexcept {
     }
     operation_ = Operation::Output;
     editor.BeginOutput();
+    // 合成完整尺寸的图像后再交给桌面输出接口。用户取消保存或输出失败时，
+    // 只要当前会话仍有效，就恢复编辑并保留选区和标注，方便重试。
     Image image;
     const auto composed = editor.Render(image);
     if (FAILED(composed)) {
@@ -369,6 +374,8 @@ void App::HandleScrollAction(ScrollAction action) noexcept {
         overlay_.Resume();
         return;
     }
+    // 拼接结果同时携带首帧到长图的坐标映射，应用用它迁移普通截图的标注历史。
+    // 原遮罩和采集会话都等到长图窗口打开成功后再关闭，前面的任一步失败都可重试。
     DesktopFrame document;
     SeedPlacement placement;
     auto hr = scrolling_.Finish(document.image, placement);

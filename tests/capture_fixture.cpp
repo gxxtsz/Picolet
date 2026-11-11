@@ -1,9 +1,9 @@
 // 直接复用生产采集浮窗及编辑器的交互夹具，配合 scroll_fixture 验证实际 GDI 与线程生命周期。
 // 测试入口不注册全局热键，也不读写用户快捷键设置，可独立启动和重复验证。
-#include <picolet/ui/long_capture.h>
-#include <picolet/ui/overlay.h>
-#include <picolet/ui/pins.h>
-#include <picolet/image/export.h>
+#include <picolet/desktop/long_capture.h>
+#include <picolet/desktop/overlay.h>
+#include <picolet/desktop/pins.h>
+#include <picolet/desktop/export.h>
 #include <commctrl.h>
 #include <dwmapi.h>
 #include <objbase.h>

@@ -161,14 +161,14 @@ ctest --preset msvc-release
 
 ### 仅构建应用或指定模块
 
-只构建应用，或只构建滚动模块及其依赖：
+可单独构建应用或截图处理库：
 
 ```powershell
 cmake --build --preset msvc-release --target Picolet --parallel
-cmake --build --preset mingw-debug --target picolet_scroll --parallel
+cmake --build --preset mingw-debug --target picolet_capture --parallel
 ```
 
-构建命令使用真实目标名，如 `picolet_scroll`；`Picolet::scroll` 是 CMake 脚本中用于声明链接依赖的别名。
+构建命令使用真实目标名 `Picolet`、`picolet_capture` 或 `picolet_desktop`。CMake 脚本链接业务库时使用 `Picolet::capture` 和 `Picolet::desktop` 两个别名。
 
 发布时如需完全关闭测试目标，可使用独立目录。原有手动构建入口仍然有效：
 
@@ -221,51 +221,36 @@ cmake --preset mingw-debug -DCMAKE_MAKE_PROGRAM="C:/工具目录/ninja.exe"
 
 ## 模块与依赖管理
 
-项目采用单仓库、顶层统一配置、模块独立编译的组织方式，当前模块仅在仓库内部复用，不提供安装或外部包导出。
+项目由截图处理、桌面交互两个内部静态库和一个应用组成。顶层 CMake 统一管理版本、工具链和构建预设。
 
 ```text
 Picolet/
 ├── CMakeLists.txt          # 项目版本、平台检查、模块注册和测试开关
 ├── CMakePresets.json       # 团队共享的配置、构建和测试入口
-├── cmake/                 # 目标编译策略和 Unicode 入口配置
+├── cmake/                 # Win32 接口目标、编译策略和 Unicode 入口配置
+├── include/picolet/       # 两个模块共用的 win32.h
 ├── modules/
-│   ├── win32/             # Win32 基础封装，仅含头文件
-│   ├── image/             # 图像、屏幕采集和图片输出
-│   ├── scroll/            # 滚动拼接、帧跟踪、采集流水线
-│   ├── edit/              # 选区、标注和撤销重做
-│   ├── system/            # 快捷键、自启动和设置提交
-│   └── ui/                # 遮罩、编辑器、浮窗、工具栏和贴图
-├── app/                   # 入口、托盘和功能协调
+│   ├── capture/           # 图像、普通及滚动采集、HDR、拼接、标注和 PNG 写入
+│   └── desktop/           # 窗口、工具栏、贴图、桌面输出、快捷键和设置
+├── app/                   # 单实例、托盘、消息循环和截图会话协调
 ├── resources/             # 图标、资源编号、对话框和版本模板
 └── tests/                 # 自动测试及交互夹具
 ```
 
-各业务模块包含自己的 `CMakeLists.txt`、`include/picolet/模块名/` 和 `src/`。公开头文件统一使用 `<picolet/模块名/头文件名.h>` 引用；实现目录不向其他模块公开。Win32 基础模块只有公开头文件。
+业务模块的公开头文件分别放在各自的 `include/picolet/capture/` 和 `include/picolet/desktop/`。例如，使用 `<picolet/capture/capture_pipeline.h>` 引用采集流水线，使用 `<picolet/desktop/overlay.h>` 引用截图遮罩。实现和内部头文件放在各模块的 `src/`。HDR 色彩转换和贴图阴影的内部头文件仅通过测试目标的私有包含路径访问。
 
-| 目标别名 | 公开模块依赖 | 职责 |
+| 业务目标 | 公开依赖 | 职责 |
 | --- | --- | --- |
-| `Picolet::win32` | 无 | 句柄、COM、字体等基础封装，以及公共 Windows 编译定义 |
-| `Picolet::image` | `win32` | 像素存储、桌面及区域采集、绘制、PNG 和剪贴板输出 |
-| `Picolet::scroll` | `image`、`win32`、`Threads::Threads` | 拼接、帧跟踪、后台采集和诊断快照 |
-| `Picolet::edit` | `image`、`scroll`、`win32` | 选区调整、标注历史、长图标注迁移 |
-| `Picolet::system` | `win32` | 快捷键、自启动、设置提交和回滚 |
-| `Picolet::ui` | `image`、`scroll`、`edit`、`system`、`win32` | 截图和长图界面、工具栏、贴图与设置窗口 |
-| `Picolet::resources` | 无 | 资源编号和当前构建目录生成的版本头 |
+| `Picolet::capture` | `Picolet::win32`、`Threads::Threads` | 像素存储、桌面和区域采集、HDR 转换、滚动拼接和预览快照、选区与标注历史、PNG 编码及文件写入 |
+| `Picolet::desktop` | `Picolet::capture`、`Picolet::win32` | 普通遮罩、长图编辑、采集浮窗、工具栏、贴图、剪贴板、保存对话框、快捷键、自启动和设置提交 |
 
-`win32` 和 `resources` 是接口目标，其余业务模块是静态库。应用与测试链接这些库，生产界面不在各个测试中重复编译。公开类定义需要的视口、绘制缓冲、工具栏头文件属于 UI 接口；贴图阴影保留为内部实现，仅向现有白盒测试开放私有包含路径。
+业务依赖由 `desktop` 指向 `capture`。普通截图和滚动采集共用像素及显示器配置，标注历史使用拼接返回的 `SeedPlacement` 迁移到长图。桌面层处理用户选择路径和覆盖确认，再调用 `capture` 的 `SavePngFile`。应用链接两个库，协调冻结帧、窗口会话及输出。滚动流水线测试和原生滚动探针可直接链接 `capture`。
 
-`edit` 使用滚动模块的 `SeedPlacement` 迁移标注，因此保留 `edit → scroll` 依赖。普通遮罩和长图编辑共同实现 `SelectionOverlay`，统一归属 UI 模块。模块化不改变这些类型、函数签名和线程约定。
+新增实现时在所属模块的 `CMakeLists.txt` 中列出源码，为接口和关键代码写明中文说明。头文件需要的依赖使用 `PUBLIC`，实现所用的 SDK 库使用 `PRIVATE`。应用和测试通过链接目标复用实现。
 
-### 新模块接入约定
+`cmake/PicoletOptions.cmake` 统一设置 C++20、警告选项和静态运行库。接口目标 `Picolet::win32` 提供 `<picolet/win32.h>`、Windows 编译定义及基础链接依赖。使用 `wmain` 或 `wWinMain` 的目标通过 `picolet_use_unicode_entry()` 配置入口。
 
-1. 在 `modules` 下建立模块目录，把公开声明放入 `include/picolet/模块名/`，实现与内部头文件放入 `src/`，并为公开接口补充中文说明。
-2. 用 `add_library(picolet_模块名 STATIC ...)` 显式列出源码，建立 `Picolet::模块名` 别名，并调用 `picolet_configure_target()`。仅有头文件的模块使用 `INTERFACE` 目标，无需调用该函数。
-3. 通过 `target_include_directories()` 公开本模块的 `include` 目录；通过 `target_link_libraries()` 声明直接依赖。公开头文件需要的依赖使用 `PUBLIC`，实现细节使用 `PRIVATE`，仅提供给使用方的要求使用 `INTERFACE`。避免循环依赖和全局包含路径。
-4. 在顶层按依赖顺序调用 `add_subdirectory()`；应用和测试通过链接目标使用模块，不复制生产源码列表。
-
-公共编译策略位于 `cmake/PicoletOptions.cmake`：C++20、禁用语言扩展、私有警告选项及静态运行库保持一致。Windows 宏与内联基础函数需要的系统库由 `Picolet::win32` 传播。使用 `wmain` 或 `wWinMain` 的可执行目标另外调用 `picolet_use_unicode_entry()`，普通 `main` 测试不调用。
-
-新增需要图标、清单或设置对话框的可执行目标时，调用 `picolet_add_resources()`。资源直接嵌入最终可执行文件，不能只放进静态库。该函数同时处理各目标目录中的资源依赖、MinGW 资源编码和 MSVC 清单选项。
+`Picolet::resources` 提供资源编号和版本头。应用和需要图标、清单或对话框的测试程序通过 `picolet_add_resources()` 将资源嵌入各自的可执行文件。该函数同时处理资源依赖、MinGW 资源编码和 MSVC 清单选项。
 
 项目版本只在顶层 `project(Picolet VERSION ...)` 修改。版本头与清单生成在当前构建目录的 `generated` 下，不写回源码，也不在不同工具链之间共享。
 

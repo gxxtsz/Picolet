@@ -1,8 +1,8 @@
 // 防闪烁回归：对真实 GDI 像素、窗口脏区域及生产绘制入口做检查，不依赖静态截图判断闪烁。
 // 更新区测试窗口位于屏幕外且不激活，不注册热键、不安装输入钩子，不改变用户窗口或剪贴板。
-#include <picolet/ui/paint_buffer.h>
-#include <picolet/ui/overlay.h>
-#include <picolet/ui/long_capture.h>
+#include <picolet/desktop/paint_buffer.h>
+#include <picolet/desktop/overlay.h>
+#include <picolet/desktop/long_capture.h>
 
 #include <objbase.h>
 #include <gdiplus.h>

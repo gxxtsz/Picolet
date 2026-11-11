@@ -1,9 +1,9 @@
-#include <picolet/edit/capture_edit.h>
-#include <picolet/image/export.h>
-#include <picolet/system/hotkeys.h>
+#include <picolet/capture/capture_edit.h>
+#include <picolet/capture/png_export.h>
+#include <picolet/desktop/hotkeys.h>
 #include "hdr_color.h"
 #include "pin_shadow.h"
-#include <picolet/win32/win32.h>
+#include <picolet/win32.h>
 
 #include <wincodec.h>
 
