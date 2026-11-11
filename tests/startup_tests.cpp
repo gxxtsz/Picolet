@@ -25,7 +25,8 @@ class RegistrySandbox {
 public:
     RegistrySandbox() {
         HKEY raw = nullptr;
-        Check(RegOpenKeyExW(HKEY_CURRENT_USER, L"", 0, KEY_ALL_ACCESS, &raw) == ERROR_SUCCESS, "无法打开测试注册表根键");
+        // 空子键会让 RegOpenKeyEx 返回预定义句柄，覆盖 HKCU 后该句柄也会指向沙箱。
+        Check(RegOpenCurrentUser(KEY_ALL_ACCESS, &raw) == ERROR_SUCCESS, "无法打开测试注册表根键");
         original_.reset(raw);
         Check(SUCCEEDED(StartupRegistration(original_.get()).Read(realBefore_)), "无法记录真实启动项");
         path_ = L"Software\\Picolet_Test_Startup_" + std::to_wstring(GetCurrentProcessId()) + L"_" + std::to_wstring(GetTickCount64());

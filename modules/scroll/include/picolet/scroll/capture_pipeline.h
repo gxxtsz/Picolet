@@ -7,15 +7,16 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 namespace picolet {
 
-// Ready 可提交画面；Paused 仅暂时失焦，可恢复；Blocked 表示目标几何失效，不再新增内容。
+// Ready 表示可采集，Paused 表示暂时失焦，Blocked 表示目标窗口或显示配置已失效。
 enum class CaptureSourceState { Ready, Paused, Blocked };
 
 // 原生和测试来源共用此接口。Open、Read、Close 均由采集线程调用；析构时已完成 Close。
-// S_FALSE 表示暂时失焦等暂停，state=Blocked 表示窗口几何变化，需要结束本次采集。
+// Open 返回 S_FALSE 表示首帧配置已失效。Read 返回 S_FALSE 时由 state 区分暂无更新、失焦和失效。
 class ScrollCaptureSource {
 public:
     virtual ~ScrollCaptureSource() = default;
@@ -31,13 +32,15 @@ struct NativeScrollCaptureOptions {
     RECT area{}, targetRect{};
     HWND target = nullptr, coordinator = nullptr;
     UINT dpi = USER_DEFAULT_SCREEN_DPI;
+    // 普通截图提供的首帧配置按值传入后台，保证首帧和后续帧使用同一显示器与参考白。
+    std::optional<DisplayCaptureProfile> seedDisplay;
     // 采集排除失败且浮窗相交时，后台携会话编号、请求编号投递这两个 UI 消息。
     // prepare 隐藏并刷新桌面后调用 AllowCapture，restore 在取帧后恢复浮窗。
     UINT prepareMessage = 0, restoreMessage = 0;
     bool hideBeforeCapture = false;
 };
 
-// 创建原生来源只分配常规对象，所有 GDI 资源都延迟到采集线程的 Open/Close 中创建和释放。
+// 创建原生来源只分配常规对象，所有 GDI 与 HDR 资源均在采集线程打开和释放。
 std::unique_ptr<ScrollCaptureSource> MakeNativeScrollSource(const NativeScrollCaptureOptions& options) noexcept;
 
 struct CapturePipelineLimits {
@@ -86,7 +89,7 @@ public:
     void RequestFinish() noexcept;
     // 因窗口或显示变化停止来源，保留已采集队列，允许完成已有结果。
     void StopCapture() noexcept;
-    // 取消会话并唤醒所有等待，等待线程释放 GDI 后再释放像素及来源对象，可重复调用。
+    // 取消会话并唤醒所有等待，等待线程释放采集资源后再释放像素及来源对象，可重复调用。
     void Cancel() noexcept;
     // 方向仅为短时提示；触摸板惯性阶段即使没有滚轮消息，也持续由实际画面判断运动。
     void SetDirection(ScrollDirection direction) noexcept;

@@ -287,8 +287,11 @@ void App::StartCapture() noexcept {
     GetCursorPos(&origin);
     // 已有贴图和其他桌面窗口一起取帧；任何新遮罩都在抓取完成后创建。
     DwmFlush();
-    if (FAILED(CaptureDesktop(frame_))) {
-        EndCapture(L"无法读取桌面画面，请重试。");
+    const auto captured = CaptureDesktop(frame_);
+    if (FAILED(captured)) {
+        EndCapture(captured == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED)
+            ? L"当前系统或显示设备无法采集 HDR 画面，请检查显示配置后重试。"
+            : L"无法读取桌面画面，请重试。");
         return;
     }
     operation_ = Operation::Selecting;
@@ -351,7 +354,7 @@ void App::StartLongCapture() noexcept {
     overlay_.Suspend();
     DwmFlush();
     const auto hr = scrolling_.Open(instance_, window_, longAnchor_, seed, std::move(annotated),
-                                    hotkeys_.bindings()[ShortcutIndex(Shortcut::Cancel)]);
+                                    hotkeys_.bindings()[ShortcutIndex(Shortcut::Cancel)], frame_.FindDisplay(longAnchor_));
     if (FAILED(hr)) {
         scrolling_.Close();
         operation_ = Operation::Selecting;

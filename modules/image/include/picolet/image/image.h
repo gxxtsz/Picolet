@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <vector>
 
@@ -32,10 +33,21 @@ private:
     std::vector<std::uint32_t> pixels_;
 };
 
+// 一次采集所用的显示器配置。参考白为 DISPLAYCONFIG_SDR_WHITE_LEVEL 的原始值，0 表示 SDR。
+struct DisplayCaptureProfile {
+    HMONITOR monitor = nullptr;
+    RECT bounds{};
+    UINT32 sdrWhiteLevel = 0;
+};
+
 struct DesktopFrame {
     // 桌面物理坐标的外接矩形。左上角可以在主屏原点的左侧或上方。
     RECT bounds{};
     Image image;
+    std::vector<DisplayCaptureProfile> displays;
+
+    // 滚动首帧只能来自一块屏幕。返回的配置与首帧一同有效，交给后台前须复制。
+    const DisplayCaptureProfile* FindDisplay(const RECT& screenRect) const noexcept;
 };
 
 // 在显示任何选区窗口之前获取各显示器的内容，空隙保留为黑色。
@@ -45,23 +57,31 @@ HRESULT CaptureDesktop(DesktopFrame& result) noexcept;
 // 矩形必须完整位于同一显示器内；失败时不改变 result，像素的 Alpha 始终补为不透明。
 HRESULT CaptureRegion(const RECT& screenRect, Image& result) noexcept;
 
-// 可复用的同屏区域采集器。Open、Read、Close 和析构必须在同一线程执行；DC 与 DIB 不跨线程共享。
-// 内部 DIB 在 Open 时分配一次，Read 只抓取并复制到调用方拥有的缓冲，适合连续高频采集。
+class HdrCapture;
+
+// 可复用的同屏区域采集器。打开、取帧、复核与关闭在同一线程执行，采集资源也在该线程释放。
+// SDR 复用内存 DC 和 DIB，HDR 复用会话与选区读回纹理，两者均可写入调用方已有的图像缓冲。
 class RegionCaptureSource {
 public:
-    RegionCaptureSource() = default;
-    ~RegionCaptureSource() { Close(); }
+    RegionCaptureSource() noexcept;
+    ~RegionCaptureSource();
     RegionCaptureSource(const RegionCaptureSource&) = delete;
     RegionCaptureSource& operator=(const RegionCaptureSource&) = delete;
 
-    // 绑定同一显示器内的完整物理矩形。失败释放本次创建的资源，调用方可重新 Open。
-    HRESULT Open(const RECT& screenRect) noexcept;
-    // 已有输出缓冲尺寸一致时直接复用；GDI 刷新完成后才读取像素，成功时 Alpha 为不透明。
-    HRESULT Read(Image& buffer) noexcept;
-    // 在所属线程恢复原位图并释放所有 GDI 资源，可重复调用。
+    // 有首帧配置时校验显示器、尺寸和参考白，配置已变化返回 S_FALSE。stopEvent 由调用方持有。
+    HRESULT Open(const RECT& screenRect, const DisplayCaptureProfile* seed = nullptr,
+                 HANDLE stopEvent = nullptr) noexcept;
+    // S_OK 提交不透明像素，S_FALSE 表示暂无新帧。面板隐藏或恢复焦点后可要求从新会话取帧，避开旧画面。
+    HRESULT Read(Image& buffer, bool freshSession = false) noexcept;
+    // 复核当前屏幕与打开时的配置，S_FALSE 表示选区失效或颜色模式已变化。
+    HRESULT VerifyDisplay() const noexcept;
+    // 在所属线程关闭会话或恢复原位图后释放资源，可重复调用。
     void Close() noexcept;
 private:
     RECT rect_{};
+    DisplayCaptureProfile display_{};
+    std::unique_ptr<HdrCapture> hdr_;
+    HANDLE stopEvent_ = nullptr;
     HDC screen_ = nullptr, memory_ = nullptr;
     HBITMAP bitmap_ = nullptr;
     HGDIOBJ previous_ = nullptr;

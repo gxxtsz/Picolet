@@ -6,6 +6,7 @@
 namespace picolet {
 namespace {
 std::atomic<std::uint64_t> nextSession{0};
+constexpr ULONGLONG kDisplayCheckIntervalMs = 250;
 
 class NativeScrollSource final : public ScrollCaptureSource {
 public:
@@ -14,7 +15,8 @@ public:
     HRESULT Open(std::uint64_t session, HANDLE stop) noexcept override {
         session_ = session; stop_ = stop;
         if (options_.hideBeforeCapture && !permission_) return E_OUTOFMEMORY;
-        return source_.Open(options_.area);
+        lastDisplayCheck_ = GetTickCount64();
+        return source_.Open(options_.area, options_.seedDisplay ? &*options_.seedDisplay : nullptr, stop_);
     }
     HRESULT Read(Image& image, CaptureSourceState& state) noexcept override {
         RECT rect{};
@@ -22,22 +24,43 @@ public:
             !EqualRect(&rect, &options_.targetRect) || GetDpiForWindow(options_.target) != options_.dpi) {
             state = CaptureSourceState::Blocked; return S_FALSE;
         }
-        if (GetAncestor(GetForegroundWindow(), GA_ROOT) != options_.target) { state = CaptureSourceState::Paused; return S_FALSE; }
+        if (GetAncestor(GetForegroundWindow(), GA_ROOT) != options_.target) {
+            lostFocus_ = true;
+            state = CaptureSourceState::Paused;
+            return S_FALSE;
+        }
         state = CaptureSourceState::Ready;
+        // 固定本次滚动的显示配置。焦点恢复时立即复核，持续滚动时定期检查 SDR 白位和 HDR 模式。
+        const auto now = GetTickCount64();
+        if (lostFocus_ || now - lastDisplayCheck_ >= kDisplayCheckIntervalMs) {
+            const auto verified = source_.VerifyDisplay();
+            if (verified == S_FALSE) state = CaptureSourceState::Blocked;
+            if (verified != S_OK) return verified;
+            lastDisplayCheck_ = now;
+        }
         std::uint64_t request = 0;
         if (options_.hideBeforeCapture) {
             ResetEvent(permission_.get());
             request = waiting_.fetch_add(1) + 1;
             if (!PostMessageW(options_.coordinator, options_.prepareMessage, static_cast<WPARAM>(session_), static_cast<LPARAM>(request))) return E_ABORT;
             const HANDLE events[]{stop_, permission_.get()};
-            if (WaitForMultipleObjects(2, events, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) return E_ABORT;
+            if (WaitForMultipleObjects(2, events, FALSE, INFINITE) != WAIT_OBJECT_0 + 1) {
+                // 停止信号可能在面板已经隐藏后到达。补发恢复请求，保留完成已有长图的入口。
+                PostMessageW(options_.coordinator, options_.restoreMessage, static_cast<WPARAM>(session_), static_cast<LPARAM>(request));
+                return E_ABORT;
+            }
         }
-        const auto hr = source_.Read(image);
+        const auto hr = source_.Read(image, options_.hideBeforeCapture || lostFocus_);
+        lostFocus_ = false;
         if (options_.hideBeforeCapture)
             PostMessageW(options_.coordinator, options_.restoreMessage, static_cast<WPARAM>(session_), static_cast<LPARAM>(request));
         if (!GetWindowRect(options_.target, &rect) || !EqualRect(&rect, &options_.targetRect) ||
             GetDpiForWindow(options_.target) != options_.dpi) { state = CaptureSourceState::Blocked; return S_FALSE; }
-        if (GetAncestor(GetForegroundWindow(), GA_ROOT) != options_.target) { state = CaptureSourceState::Paused; return S_FALSE; }
+        if (GetAncestor(GetForegroundWindow(), GA_ROOT) != options_.target) {
+            lostFocus_ = true;
+            state = CaptureSourceState::Paused;
+            return S_FALSE;
+        }
         return hr;
     }
     void Close() noexcept override { source_.Close(); }
@@ -51,6 +74,8 @@ private:
     HANDLE stop_ = nullptr;
     std::atomic<std::uint64_t> waiting_{0};
     std::uint64_t session_ = 0;
+    ULONGLONG lastDisplayCheck_ = 0;
+    bool lostFocus_ = false;
 };
 
 std::uint64_t FrameHash(const Image& image) noexcept {
@@ -177,15 +202,19 @@ void ScrollCapturePipeline::CaptureLoop() noexcept {
             Recycle(std::move(image));
         }
         if (SUCCEEDED(error) && !cancel_) error = source_->Open(session_, stopEvent_.get());
+        if (error == S_FALSE) {
+            std::lock_guard lock(mutex_);
+            snapshot_.source = CaptureSourceState::Blocked;
+        }
         KernelHandle timer(CreateWaitableTimerExW(nullptr, nullptr, 0x00000002, TIMER_ALL_ACCESS));
         if (!timer) timer.reset(CreateWaitableTimerExW(nullptr, nullptr, 0, TIMER_ALL_ACCESS));
-        if (!timer && SUCCEEDED(error)) error = LastErrorResult();
+        if (!timer && error == S_OK) error = LastErrorResult();
         const auto period = std::chrono::microseconds(1000000 / limits_.framesPerSecond);
         auto next = std::chrono::steady_clock::now();
         std::uint64_t sequence = 0, finishAt = 0, lastHash = 0;
         bool haveHash = false, gap = false;
         int still = 0;
-        while (SUCCEEDED(error) && !cancel_ && !stopCapture_) {
+        while (error == S_OK && !cancel_ && !stopCapture_) {
             next = std::max(next + period, std::chrono::steady_clock::now());
             LARGE_INTEGER due{};
             due.QuadPart = -std::max<LONGLONG>(1, std::chrono::duration_cast<std::chrono::nanoseconds>(next - std::chrono::steady_clock::now()).count() / 100);
@@ -208,6 +237,10 @@ void ScrollCapturePipeline::CaptureLoop() noexcept {
             error = source_->Read(frame.image, state);
             const auto captureCost = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                 std::chrono::steady_clock::now() - captureStarted).count());
+            if (cancel_ || stopCapture_) {
+                Recycle(std::move(frame.image));
+                break;
+            }
             {
                 std::lock_guard lock(mutex_);
                 snapshot_.source = state;
@@ -215,7 +248,8 @@ void ScrollCapturePipeline::CaptureLoop() noexcept {
             if (error == S_FALSE) {
                 Recycle(std::move(frame.image));
                 error = S_OK;
-                if (state == CaptureSourceState::Blocked || finish_) break;
+                // WGC 在静止时可以没有新帧。完成阶段仍等待剩余窗口，以便接收滚动惯性的末尾画面。
+                if (state == CaptureSourceState::Blocked || (state == CaptureSourceState::Paused && finish_)) break;
                 continue;
             }
             if (FAILED(error)) { Recycle(std::move(frame.image)); break; }
@@ -244,7 +278,7 @@ void ScrollCapturePipeline::CaptureLoop() noexcept {
             if (finishAt && Now() - finishAt >= 180 && still >= 1) break;
         }
     } catch (...) { error = E_OUTOFMEMORY; }
-    source_->Close();  // 与 Open/Read 同线程释放 DC 和 DIB。
+    source_->Close();  // 与 Open/Read 同线程释放 GDI 或 HDR 采集资源。
     {
         std::lock_guard lock(mutex_);
         if (FAILED(error) && !cancel_ && !stopCapture_) snapshot_.error = error;

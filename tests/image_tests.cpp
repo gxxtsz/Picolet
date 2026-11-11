@@ -1,6 +1,7 @@
 #include <picolet/edit/capture_edit.h>
 #include <picolet/image/export.h>
 #include <picolet/system/hotkeys.h>
+#include "hdr_color.h"
 #include "pin_shadow.h"
 #include <picolet/win32/win32.h>
 
@@ -48,6 +49,50 @@ void TestCrop() {
     Check(EqualRect(&clipped, &frame.bounds) != FALSE, "越界拖动未裁到桌面边缘");
     const RECT click = SelectionRect({-2, -2}, {-2, -2}, frame.bounds);
     Check(IsRectEmpty(&click) != FALSE, "单击应保留框选状态");
+}
+
+void TestHdrColor() {
+    using HalfPixel = std::array<std::uint16_t, 4>;
+    // 两块屏幕分别将相同的 SDR 色块合成到 80 和 240 尼特。每行末尾的像素用来检验填充处理。
+    const std::array<HalfPixel, 8> at80{{
+        {0x3b80, 0x3b80, 0x3b80, 0}, {0x3c00, 0x3c00, 0x3c00, 0},
+        {0x4000, 0x4000, 0x4000, 0}, {0x7bff, 0, 0, 0},
+        {0x4400, 0x4400, 0x4400, 0}, {0x3800, 0x3400, 0x7c00, 0},
+        {0x4000, 0x3c00, 0x3800, 0}, {0, 0, 0x7bff, 0},
+    }};
+    const std::array<HalfPixel, 8> at240{{
+        {0x41a0, 0x41a0, 0x41a0, 0}, {0x4200, 0x4200, 0x4200, 0},
+        {0x4600, 0x4600, 0x4600, 0}, {0, 0x7bff, 0, 0},
+        {0x4a00, 0x4a00, 0x4a00, 0}, {0x3e00, 0x3a00, 0xbc00, 0},
+        {0x4600, 0x4200, 0x3e00, 0}, {0, 0, 0x7bff, 0},
+    }};
+    constexpr std::uint32_t padding = 0x12345678;
+    std::array<std::uint32_t, 8> first, second;
+    first.fill(padding);
+    second.fill(padding);
+    constexpr auto sourcePitch = 4 * sizeof(HalfPixel);
+    Check(ConvertHdrPixels(std::as_bytes(std::span(at80)), sourcePitch, 1000, first, 4, 3, 2) == S_OK &&
+          ConvertHdrPixels(std::as_bytes(std::span(at240)), sourcePitch, 3000, second, 4, 3, 2) == S_OK,
+          "浮点截图转换失败");
+    constexpr std::array<std::uint32_t, 8> expected{
+        0xfff3f3f3, 0xfff8f8f8, 0xfffcfcfc, padding,
+        0xfffdfdfd, 0xffbc8900, 0xfffcb987, padding,
+    };
+    Check(first == expected && second == expected, "参考白校正、近白色阶、高光或 BGRA 行距不正确");
+    const auto truncated = std::as_bytes(std::span(at80)).first(sourcePitch + 2 * sizeof(HalfPixel));
+    Check(ConvertHdrPixels(truncated, sourcePitch, 1000, first, 4, 3, 2) == E_INVALIDARG && first == expected,
+          "不完整的输入行修改了目标图像");
+}
+
+void TestCaptureDisplay() {
+    DesktopFrame frame;
+    frame.displays = {{nullptr, {-5, -5, 0, 3}, 3000}, {nullptr, {0, 0, 8, 4}, 0}};
+    const auto* hdr = frame.FindDisplay({-5, -3, 0, 1});
+    const auto* sdr = frame.FindDisplay({0, 0, 4, 2});
+    Check(hdr && hdr->sdrWhiteLevel == 3000 && sdr && sdr->sdrWhiteLevel == 0,
+          "选区未绑定到对应显示器的参考白");
+    Check(!frame.FindDisplay({-1, 0, 1, 2}) && !frame.FindDisplay({1, -1, 2, 1}),
+          "跨屏或包含屏幕空隙的选区应拒绝绑定单屏长截图");
 }
 
 void TestSelectionAdjustments() {
@@ -408,6 +453,8 @@ int main() {
     int status = 0;
     try {
         TestCrop();
+        TestHdrColor();
+        TestCaptureDisplay();
         TestSelectionAdjustments();
         TestPinShadow();
         TestAnnotations();

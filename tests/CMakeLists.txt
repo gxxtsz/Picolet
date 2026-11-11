@@ -4,8 +4,9 @@ picolet_configure_target(picolet_image_tests)
 target_link_libraries(picolet_image_tests PRIVATE
     Picolet::image Picolet::edit Picolet::system Picolet::win32 ole32 windowscodecs uuid
 )
-# 贴图阴影是 UI 内部实现，只为已有白盒测试提供私有访问路径，不扩大 UI 的公开接口。
-target_include_directories(picolet_image_tests PRIVATE "${PROJECT_SOURCE_DIR}/modules/ui/src")
+# 贴图阴影和 HDR 转换均为内部实现，通过私有包含路径测试，不扩大模块接口。
+target_include_directories(picolet_image_tests PRIVATE
+    "${PROJECT_SOURCE_DIR}/modules/ui/src" "${PROJECT_SOURCE_DIR}/modules/image/src")
 add_test(NAME picolet.image COMMAND picolet_image_tests)
 
 add_executable(picolet_scroll_tests scroll_tests.cpp)

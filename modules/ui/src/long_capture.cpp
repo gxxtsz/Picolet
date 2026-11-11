@@ -41,7 +41,7 @@ bool LongCaptureSession::Register(HINSTANCE instance, HICON icon) noexcept {
 }
 
 HRESULT LongCaptureSession::Open(HINSTANCE instance, HWND owner, RECT area, const Image& seed,
-    Image&& annotatedSeed, Hotkey cancelKey) noexcept {
+    Image&& annotatedSeed, Hotkey cancelKey, const DisplayCaptureProfile* seedDisplay) noexcept {
     Close();
     MONITORINFO info{};
     info.cbSize = sizeof(info);
@@ -118,6 +118,7 @@ HRESULT LongCaptureSession::Open(HINSTANCE instance, HWND owner, RECT area, cons
     ShowWindow(panel_, SW_SHOWNOACTIVATE);
     NativeScrollCaptureOptions options;
     options.area = area_; options.targetRect = targetRect_; options.target = target_; options.dpi = targetDpi_;
+    if (seedDisplay) options.seedDisplay = *seedDisplay;
     options.coordinator = panel_; options.prepareMessage = kPrepareCapture; options.restoreMessage = kRestoreCapture;
     RECT panelRect{}, overlap{};
     GetWindowRect(panel_, &panelRect); InflateRect(&panelRect, Dip(16, dpi_), Dip(16, dpi_));
@@ -344,7 +345,7 @@ void LongCaptureSession::Tick() noexcept {
     if (!IsWindow(target_) || IsIconic(target_) || !GetWindowRect(target_, &rect) || !EqualRect(&rect, &targetRect_) ||
         GetDpiForWindow(target_) != targetDpi_ || snapshot_.source == CaptureSourceState::Blocked) {
         blocked_ = true; pipeline_.StopCapture();
-        Pause(L"原窗口位置或尺寸已变化，请完成当前长图或重新框选。");
+        Pause(L"原窗口或显示配置已变化，请完成当前长图或重新框选。");
         return;
     }
     if (FAILED(snapshot_.error)) {

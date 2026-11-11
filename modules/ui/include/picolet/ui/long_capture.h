@@ -18,9 +18,9 @@ public:
     static bool Register(HINSTANCE instance, HICON icon) noexcept;
 
     // 调用前必须挂起普通截图遮罩。area 为同屏、同窗口的物理选区，seed 不含标注；
-    // annotatedSeed 仅供预览，成功时转移所有权。失败时调用方可以恢复原普通截图。
+    // annotatedSeed 仅供预览，成功时转移所有权。seedDisplay 在启动后台采集前复制，用于复核颜色配置。
     HRESULT Open(HINSTANCE instance, HWND owner, RECT area, const Image& seed,
-                 Image&& annotatedSeed, Hotkey cancelKey) noexcept;
+                 Image&& annotatedSeed, Hotkey cancelKey, const DisplayCaptureProfile* seedDisplay = nullptr) noexcept;
     // 停止定时器、输入监听和自动滚动，唤醒等待并加入两个后台线程后释放窗口及像素；可重复调用。
     void Close() noexcept;
     // 将已可靠拼接的像素生成完整图片，placement 同时给出原标注迁移所需的三段映射。

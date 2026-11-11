@@ -55,13 +55,14 @@ public:
         return &value_;
     }
 
-private:
+    // 在结束资源所属的会话或线程单元之前，可显式释放当前 COM 引用。
     void reset() noexcept {
         if (auto* old = std::exchange(value_, nullptr)) {
             old->Release();
         }
     }
 
+private:
     Interface* value_ = nullptr;
 };
 

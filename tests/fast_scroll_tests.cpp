@@ -199,8 +199,8 @@ void TestSparseRepaint() {
 
 struct ScriptControl {
     std::atomic<DWORD> opened{0}, read{0}, closed{0};
-    std::atomic<bool> paused{false}, blocked{false};
-    std::atomic<int> calls{0}, allowed{0};
+    std::atomic<bool> paused{false}, blocked{false}, idle{false};
+    std::atomic<int> calls{0}, allowed{0}, idleReads{0};
 };
 
 class ScriptSource final : public ScrollCaptureSource {
@@ -212,6 +212,7 @@ public:
         control_->read = GetCurrentThreadId();
         if (control_->blocked) { state = CaptureSourceState::Blocked; return S_FALSE; }
         if (control_->paused) { state = CaptureSourceState::Paused; return S_FALSE; }
+        if (control_->idle) { state = CaptureSourceState::Ready; ++control_->idleReads; return S_FALSE; }
         try {
             const int index = control_->calls.fetch_add(1);
             const int position = positions_.empty() ? index * 100000 : positions_[std::min<std::size_t>(index, positions_.size() - 1)];
@@ -290,6 +291,29 @@ void TestBacklog() {
     pipeline.Cancel();
 }
 
+void TestFinishAfterIdleFrames() {
+    Image seed; FillFrame(seed, 0);
+    ScrollCapturePipeline pipeline;
+    const auto control = std::make_shared<ScriptControl>();
+    control->idle = true;
+    Check(pipeline.Start(seed, Image{}, std::make_unique<ScriptSource>(control, std::vector<int>{64, 128}), {120, 200}) == S_OK,
+          "启动静止帧测试失败");
+    WaitFor(pipeline, [&](const auto&) { return control->idleReads >= 2; });
+    const auto beforeFinish = control->idleReads.load();
+    pipeline.RequestFinish();
+    // WGC 在画面静止时不一定送帧，稍后到达的惯性滚动仍应被拼入最终结果。
+    const auto idle = WaitFor(pipeline, [&](const auto& snapshot) {
+        return snapshot.finished || control->idleReads >= beforeFinish + 3;
+    });
+    Check(!idle.finished && idle.stats.captured == 0 && idle.stats.samplingGaps == 0,
+          "静止时提前结束或记录了虚假的采集帧");
+    control->idle = false;
+    const auto finished = WaitFor(pipeline, [](const auto& snapshot) { return snapshot.finished; });
+    Image result; SeedPlacement placement;
+    Check(SUCCEEDED(finished.error) && pipeline.Result(result, placement) == S_OK, "末尾帧到达后未能完成");
+    Verify(result, 0, 128 + 410);
+}
+
 void TestPipelineLimit() {
     Image seed; FillFrame(seed, 0);
     ScrollCapturePipeline pipeline;
@@ -331,7 +355,7 @@ int main(int argc, char** argv) {
         if (argc > 1 && std::string_view(argv[1]) == "--benchmark") Benchmark();
         else {
             TestContinuousMotion(); TestBadFramesAndRecovery(); TestLowOverlapAndVersions(); TestRepeatedTextMotion();
-            TestSparseRepaint(); TestPipeline(); TestBacklog(); TestPipelineLimit();
+            TestSparseRepaint(); TestPipeline(); TestFinishAfterIdleFrames(); TestBacklog(); TestPipelineLimit();
         }
     } catch (const std::exception& error) { std::cerr << error.what() << '\n'; return 1; }
     return 0;

@@ -1,7 +1,5 @@
 #include <picolet/image/image.h>
 
-#include <picolet/win32/win32.h>
-
 #include <algorithm>
 #include <cstring>
 #include <limits>
@@ -11,19 +9,6 @@ namespace picolet {
 namespace {
 
 constexpr std::uint32_t kOpaque = 0xff000000u;
-
-BOOL CALLBACK CollectMonitor(HMONITOR, HDC, LPRECT rect, LPARAM data) noexcept {
-    auto& monitors = *reinterpret_cast<std::vector<RECT>*>(data);
-    if (!IsRectEmpty(rect)) {
-        try {
-            monitors.push_back(*rect);
-        } catch (...) {
-            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
-            return FALSE;
-        }
-    }
-    return TRUE;
-}
 
 }  // namespace
 
@@ -72,77 +57,6 @@ BITMAPINFO Image::BitmapInfo(bool topDown) const noexcept {
     return info;
 }
 
-HRESULT CaptureDesktop(DesktopFrame& result) noexcept {
-    std::vector<RECT> monitors;
-    SetLastError(ERROR_SUCCESS);
-    if (!EnumDisplayMonitors(nullptr, nullptr, CollectMonitor, reinterpret_cast<LPARAM>(&monitors))) {
-        return LastErrorResult();
-    }
-    if (monitors.empty()) {
-        return HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
-    }
-
-    DesktopFrame frame;
-    for (const auto& monitor : monitors) {
-        UnionRect(&frame.bounds, &frame.bounds, &monitor);
-    }
-    const auto width = frame.bounds.right - frame.bounds.left;
-    const auto height = frame.bounds.bottom - frame.bounds.top;
-    const HRESULT allocated = frame.image.Resize(width, height);
-    if (FAILED(allocated)) {
-        return allocated;
-    }
-
-    // 使用同一个屏幕 DC 和与它兼容的内存 DC。来源保留绝对坐标，目标减去虚拟桌面原点。
-    const auto releaseScreen = [](HDC dc) noexcept { ReleaseDC(nullptr, dc); };
-    const UniqueHandle<HDC, releaseScreen> screen(GetDC(nullptr));
-    if (!screen) {
-        return LastErrorResult();
-    }
-    const MemoryDc memory(CreateCompatibleDC(screen.get()));
-    if (!memory) {
-        return LastErrorResult();
-    }
-    const auto info = frame.image.BitmapInfo();
-    void* bits = nullptr;
-    const BitmapHandle bitmap(CreateDIBSection(screen.get(), &info, DIB_RGB_COLORS, &bits, nullptr, 0));
-    if (!bitmap || !bits) {
-        return LastErrorResult();
-    }
-    auto* source = static_cast<std::uint32_t*>(bits);
-    std::fill_n(source, frame.image.pixels().size(), 0u);
-
-    const HGDIOBJ original = SelectObject(memory.get(), bitmap.get());
-    if (!original || original == HGDI_ERROR) {
-        return LastErrorResult();
-    }
-    HRESULT captured = S_OK;
-    for (const auto& monitor : monitors) {
-        SetLastError(ERROR_SUCCESS);
-        if (!BitBlt(memory.get(), monitor.left - frame.bounds.left, monitor.top - frame.bounds.top,
-                    monitor.right - monitor.left, monitor.bottom - monitor.top,
-                    screen.get(), monitor.left, monitor.top, SRCCOPY | CAPTUREBLT)) {
-            captured = LastErrorResult();
-            break;
-        }
-    }
-    // BitBlt 可能批量提交。读取 DIB 前必须等待 GDI 完成，并恢复原有对象后再释放位图。
-    if (!GdiFlush() && SUCCEEDED(captured)) {
-        captured = E_FAIL;
-    }
-    SelectObject(memory.get(), original);
-    if (FAILED(captured)) {
-        return captured;
-    }
-
-    // GDI 没有定义第四个字节。显式设为不透明，避免 PNG 显示为透明或半透明。
-    const auto pixels = frame.image.pixels();
-    std::transform(source, source + pixels.size(), pixels.begin(),
-                   [](std::uint32_t pixel) { return pixel | kOpaque; });
-    result = std::move(frame);
-    return S_OK;
-}
-
 RECT SelectionRect(POINT first, POINT last, const RECT& bounds) noexcept {
     if (IsRectEmpty(&bounds) || (first.x == last.x && first.y == last.y)) {
         return {};
@@ -155,89 +69,6 @@ RECT SelectionRect(POINT first, POINT last, const RECT& bounds) noexcept {
         std::min(std::max(first.y, last.y), bounds.bottom - 1) + 1,
     };
     return IsRectEmpty(&candidate) ? RECT{} : candidate;
-}
-
-HRESULT CaptureRegion(const RECT& rect, Image& result) noexcept {
-    MONITORINFO monitor{};
-    monitor.cbSize = sizeof(monitor);
-    if (IsRectEmpty(&rect) || !GetMonitorInfoW(MonitorFromRect(&rect, MONITOR_DEFAULTTONULL), &monitor) ||
-        rect.left < monitor.rcMonitor.left || rect.top < monitor.rcMonitor.top ||
-        rect.right > monitor.rcMonitor.right || rect.bottom > monitor.rcMonitor.bottom) return E_INVALIDARG;
-    Image image;
-    HRESULT hr = image.Resize(rect.right - rect.left, rect.bottom - rect.top);
-    if (FAILED(hr)) return hr;
-    const auto release = [](HDC dc) noexcept { ReleaseDC(nullptr, dc); };
-    const UniqueHandle<HDC, release> screen(GetDC(nullptr));
-    const MemoryDc memory(screen ? CreateCompatibleDC(screen.get()) : nullptr);
-    if (!memory) return LastErrorResult();
-    void* bits = nullptr;
-    const auto info = image.BitmapInfo();
-    const BitmapHandle bitmap(CreateDIBSection(screen.get(), &info, DIB_RGB_COLORS, &bits, nullptr, 0));
-    if (!bitmap || !bits) return LastErrorResult();
-    const auto old = SelectObject(memory.get(), bitmap.get());
-    if (!old || old == HGDI_ERROR) return LastErrorResult();
-    const bool ok = BitBlt(memory.get(), 0, 0, image.width(), image.height(), screen.get(), rect.left, rect.top,
-                           SRCCOPY | CAPTUREBLT) && GdiFlush();
-    SelectObject(memory.get(), old);
-    if (!ok) return LastErrorResult();
-    const auto* pixels = static_cast<const std::uint32_t*>(bits);
-    std::transform(pixels, pixels + image.pixels().size(), image.pixels().begin(),
-                   [](std::uint32_t value) { return value | kOpaque; });
-    result = std::move(image);
-    return S_OK;
-}
-
-HRESULT RegionCaptureSource::Open(const RECT& rect) noexcept {
-    Close();
-    MONITORINFO monitor{};
-    monitor.cbSize = sizeof(monitor);
-    if (IsRectEmpty(&rect) || !GetMonitorInfoW(MonitorFromRect(&rect, MONITOR_DEFAULTTONULL), &monitor) ||
-        rect.left < monitor.rcMonitor.left || rect.top < monitor.rcMonitor.top ||
-        rect.right > monitor.rcMonitor.right || rect.bottom > monitor.rcMonitor.bottom) return E_INVALIDARG;
-    Image dimensions;
-    const auto hr = dimensions.Resize(rect.right - rect.left, rect.bottom - rect.top);
-    if (FAILED(hr)) return hr;
-    thread_ = GetCurrentThreadId();
-    rect_ = rect;
-    screen_ = GetDC(nullptr);
-    if (screen_) memory_ = CreateCompatibleDC(screen_);
-    void* bits = nullptr;
-    const auto info = dimensions.BitmapInfo();
-    if (memory_) bitmap_ = CreateDIBSection(screen_, &info, DIB_RGB_COLORS, &bits, nullptr, 0);
-    if (bitmap_ && bits) previous_ = SelectObject(memory_, bitmap_);
-    if (!previous_ || previous_ == HGDI_ERROR) {
-        previous_ = nullptr;
-        const auto error = LastErrorResult();
-        Close(); return error;
-    }
-    bits_ = static_cast<const std::uint32_t*>(bits);
-    return S_OK;
-}
-
-HRESULT RegionCaptureSource::Read(Image& buffer) noexcept {
-    if (!bits_ || GetCurrentThreadId() != thread_) return E_UNEXPECTED;
-    const int width = rect_.right - rect_.left, height = rect_.bottom - rect_.top;
-    if (buffer.width() != width || buffer.height() != height) {
-        const auto hr = buffer.Resize(width, height);
-        if (FAILED(hr)) return hr;
-    }
-    if (!BitBlt(memory_, 0, 0, width, height, screen_, rect_.left, rect_.top, SRCCOPY | CAPTUREBLT) || !GdiFlush())
-        return LastErrorResult();
-    std::transform(bits_, bits_ + buffer.pixels().size(), buffer.pixels().begin(),
-        [](std::uint32_t pixel) { return pixel | 0xff000000; });
-    return S_OK;
-}
-
-void RegionCaptureSource::Close() noexcept {
-    if (memory_) {
-        GdiFlush();
-        if (previous_) SelectObject(memory_, previous_);
-    }
-    if (bitmap_) DeleteObject(bitmap_);
-    if (memory_) DeleteDC(memory_);
-    if (screen_) ReleaseDC(nullptr, screen_);
-    bits_ = nullptr; previous_ = nullptr; bitmap_ = nullptr;
-    memory_ = screen_ = nullptr; thread_ = 0;
 }
 
 HRESULT CopyImageRect(const Image& image, const RECT& rect, Image& result) noexcept {
