@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Picolet VERSION 1.1.0 LANGUAGES CXX)
+project(Picolet VERSION 1.2.0 LANGUAGES CXX)
 
 if(NOT WIN32 OR NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
     message(FATAL_ERROR "Picolet 需要 Windows x64 工具链。")
