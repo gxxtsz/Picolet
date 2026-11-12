@@ -4,6 +4,11 @@
 #include <picolet/win32.h>
 
 #include <d3d11.h>
+// 部分 MinGW 头文件把 boolean 和 BYTE 映射为同一类型，导致 IReference 特化重复。
+// 采集只使用 WinRT 接口的标量布尔值，可以跳过未使用的装箱布尔特化。
+#if defined(__MINGW32__) && !defined(____FIReference_1_boolean_INTERFACE_DEFINED__)
+#define ____FIReference_1_boolean_INTERFACE_DEFINED__
+#endif
 #include <windows.graphics.capture.h>
 
 namespace picolet {
@@ -16,7 +21,8 @@ public:
     ~HdrCapture();
 
     // 将物理选区换算为显示器纹理坐标并准备读回资源，首次 Read 时才启动系统会话。
-    HRESULT Open(const DisplayCaptureProfile& display, const RECT& region) noexcept;
+    // includeCursor 固定本次会话及后续重建的帧池是否包含系统指针，默认供截图使用无指针画面。
+    HRESULT Open(const DisplayCaptureProfile& display, const RECT& region, bool includeCursor = false) noexcept;
     // 直接填充目标图像中的选区。freshSession 每次创建新帧池，取帧后立即关闭会话。
     HRESULT Read(std::span<std::uint32_t> destination, std::size_t pitch,
                  HANDLE stopEvent = nullptr, bool freshSession = false) noexcept;
@@ -46,6 +52,7 @@ private:
     D3D11_BOX crop_{};
     UINT32 whiteLevel_ = 0;
     bool firstFrame_ = true;
+    bool includeCursor_ = false;
 };
 
 }  // namespace picolet

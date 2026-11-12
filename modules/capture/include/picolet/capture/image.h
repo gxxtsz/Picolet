@@ -70,9 +70,11 @@ public:
     RegionCaptureSource(const RegionCaptureSource&) = delete;
     RegionCaptureSource& operator=(const RegionCaptureSource&) = delete;
 
-    // 有首帧配置时校验显示器、尺寸和参考白，配置已变化返回 S_FALSE。stopEvent 由调用方持有。
+    // 有首帧配置时校验显示器、尺寸和参考白，配置已变化返回 S_FALSE。stopEvent 由调用方持有至 Close，
+    // 可在 HDR 等待取帧时设置该事件使 Read 返回 E_ABORT。includeCursor 固定本会话是否采集可见的系统指针。
+    // SDR 按物理坐标和热点绘入 DIB，HDR 由系统图形采集绘入。默认关闭，供截图和滚动首帧匹配使用。
     HRESULT Open(const RECT& screenRect, const DisplayCaptureProfile* seed = nullptr,
-                 HANDLE stopEvent = nullptr) noexcept;
+                 HANDLE stopEvent = nullptr, bool includeCursor = false) noexcept;
     // S_OK 提交不透明像素，S_FALSE 表示暂无新帧。面板隐藏或恢复焦点后可要求从新会话取帧，避开旧画面。
     HRESULT Read(Image& buffer, bool freshSession = false) noexcept;
     // 复核当前屏幕与打开时的配置，S_FALSE 表示选区失效或颜色模式已变化。
@@ -89,6 +91,7 @@ private:
     HGDIOBJ previous_ = nullptr;
     const std::uint32_t* bits_ = nullptr;
     DWORD thread_ = 0;
+    bool includeCursor_ = false;
 };
 
 // 复制图片内的半开矩形；要求矩形完整有效。失败保留 result，可用于截取长图的独立条带。

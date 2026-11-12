@@ -74,7 +74,8 @@ HdrCapture::~HdrCapture() {
     StopSession();
 }
 
-HRESULT HdrCapture::Open(const DisplayCaptureProfile& display, const RECT& region) noexcept {
+HRESULT HdrCapture::Open(const DisplayCaptureProfile& display, const RECT& region, bool includeCursor) noexcept {
+    includeCursor_ = includeCursor;
     auto hr = apartment_.Initialize();
     if (FAILED(hr)) return hr;
 
@@ -143,7 +144,7 @@ HRESULT HdrCapture::StartSession() noexcept {
     hr = session_->QueryInterface(IID_PPV_ARGS(cursor.put()));
     if (hr == E_NOINTERFACE) return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
     if (FAILED(hr)) return hr;
-    hr = cursor->put_IsCursorCaptureEnabled(false);
+    hr = cursor->put_IsCursorCaptureEnabled(includeCursor_);
     if (FAILED(hr)) return hr;
     return session_->StartCapture();
 }
@@ -178,7 +179,7 @@ HRESULT HdrCapture::ReadFrame(std::span<std::uint32_t> destination, std::size_t 
         if (frame.get()) break;
         if (!firstFrame_) return S_FALSE;
 
-        // 自由线程帧池不依赖 UI 消息循环。首帧等待有上限，并能由滚动线程的停止事件提前唤醒。
+        // 自由线程帧池不依赖 UI 消息循环。首帧等待有上限，并能由调用方的停止事件提前唤醒。
         const auto now = GetTickCount64();
         if (now >= deadline) return HRESULT_FROM_WIN32(ERROR_TIMEOUT);
         const auto delay = static_cast<DWORD>(std::min<ULONGLONG>(2, deadline - now));

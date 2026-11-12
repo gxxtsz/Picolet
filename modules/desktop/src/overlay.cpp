@@ -484,6 +484,9 @@ void SelectionOverlay::PressButton(ToolbarButton button) noexcept {
     }
     case Button::Fullscreen: Command(Shortcut::Fullscreen); return;
     case Button::LongCapture: Command(Shortcut::LongCapture); return;
+    case Button::RecordGif:
+        if (!editorMode_) PostAction(OverlayAction::RecordGif);
+        return;
     case Button::Undo: Command(Shortcut::Undo); return;
     case Button::Redo: Command(Shortcut::Redo); return;
     case Button::Copy: Command(Shortcut::Copy); return;

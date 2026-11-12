@@ -9,6 +9,7 @@ add_library(picolet_capture STATIC
     "src/capture_pipeline.cpp"
     "src/capture_edit.cpp"
     "src/png_export.cpp"
+    "src/gif.cpp"
 )
 add_library(Picolet::capture ALIAS picolet_capture)
 picolet_configure_target(picolet_capture)
@@ -17,5 +18,5 @@ target_include_directories(picolet_capture PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/i
 # 公开接口使用 Win32 类型和线程类型。图形采集与 WIC 编码只需要在实现中包含对应 SDK 头文件。
 target_link_libraries(picolet_capture
     PUBLIC Picolet::win32 Threads::Threads
-    PRIVATE d3d11 dxgi ole32 runtimeobject uuid windowscodecs
+    PRIVATE d3d11 dxgi ole32 runtimeobject shlwapi uuid windowscodecs
 )

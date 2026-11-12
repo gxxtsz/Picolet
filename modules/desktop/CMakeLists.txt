@@ -3,12 +3,14 @@ add_library(picolet_desktop STATIC
     "src/overlay.cpp"
     "src/long_editor.cpp"
     "src/long_capture.cpp"
+    "src/gif_recording.cpp"
     "src/toolbar.cpp"
     "src/pins.cpp"
     "src/shortcut_dialog.cpp"
     "src/hotkeys.cpp"
     "src/startup.cpp"
     "src/export.cpp"
+    "src/gif_clipboard.cpp"
 )
 add_library(Picolet::desktop ALIAS picolet_desktop)
 picolet_configure_target(picolet_desktop)

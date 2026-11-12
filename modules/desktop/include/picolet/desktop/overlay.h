@@ -10,7 +10,8 @@
 namespace picolet {
 
 inline constexpr UINT kOverlayAction = WM_APP + 2;
-enum class OverlayAction : WPARAM { Cancel, Copy, Save, Pin, LongCapture };
+// RecordGif 仅由普通截图工具栏在选区有效时投递，应用随后接管录制会话。
+enum class OverlayAction : WPARAM { Cancel, Copy, Save, Pin, LongCapture, RecordGif };
 
 // 置顶遮罩和选区工具栏。调用方保有冻结帧，在关闭遮罩之前不能修改或释放它。
 // 选区和标注使用桌面物理坐标，工具栏与尺寸标签各自按所在屏幕的 DPI 布局。

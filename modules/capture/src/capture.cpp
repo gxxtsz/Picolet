@@ -26,6 +26,18 @@ bool SameDisplay(const DisplayCaptureProfile& first, const DisplayCaptureProfile
            first.sdrWhiteLevel == second.sdrWhiteLevel;
 }
 
+void DrawScreenCursor(HDC dc, const RECT& region) noexcept {
+    CURSORINFO cursor{};
+    cursor.cbSize = sizeof(cursor);
+    if (!GetCursorInfo(&cursor) || (cursor.flags & CURSOR_SHOWING) == 0 || !cursor.hCursor) return;
+    ICONINFO info{};
+    if (!GetIconInfo(cursor.hCursor, &info)) return;
+    const BitmapHandle mask(info.hbmMask), color(info.hbmColor);
+    DrawIconEx(dc, cursor.ptScreenPos.x - region.left - static_cast<int>(info.xHotspot),
+               cursor.ptScreenPos.y - region.top - static_cast<int>(info.yHotspot),
+               cursor.hCursor, 0, 0, 0, nullptr, DI_NORMAL);
+}
+
 BOOL CALLBACK CollectMonitor(HMONITOR monitor, HDC, LPRECT rect, LPARAM data) noexcept {
     auto& displays = *reinterpret_cast<std::vector<DisplayCaptureProfile>*>(data);
     if (!IsRectEmpty(rect)) {
@@ -237,7 +249,8 @@ RegionCaptureSource::~RegionCaptureSource() {
     Close();
 }
 
-HRESULT RegionCaptureSource::Open(const RECT& rect, const DisplayCaptureProfile* seed, HANDLE stopEvent) noexcept {
+HRESULT RegionCaptureSource::Open(const RECT& rect, const DisplayCaptureProfile* seed, HANDLE stopEvent,
+                                  bool includeCursor) noexcept {
     Close();
     DisplayCaptureProfile profile;
     const auto described = DescribeRegion(rect, profile);
@@ -252,9 +265,10 @@ HRESULT RegionCaptureSource::Open(const RECT& rect, const DisplayCaptureProfile*
     thread_ = GetCurrentThreadId();
     rect_ = rect;
     stopEvent_ = stopEvent;
+    includeCursor_ = includeCursor;
     if (display_.sdrWhiteLevel != 0) {
         hdr_.reset(new (std::nothrow) HdrCapture);
-        const auto hr = hdr_ ? hdr_->Open(display_, rect_) : E_OUTOFMEMORY;
+        const auto hr = hdr_ ? hdr_->Open(display_, rect_, includeCursor_) : E_OUTOFMEMORY;
         if (FAILED(hr)) Close();
         return hr;
     }
@@ -298,9 +312,11 @@ HRESULT RegionCaptureSource::Read(Image& buffer, bool freshSession) noexcept {
         if (hr != S_OK) return hr;
     } else {
         SetLastError(ERROR_SUCCESS);
-        if (!BitBlt(memory_, 0, 0, width, height, screen_, rect_.left, rect_.top, SRCCOPY | CAPTUREBLT) || !GdiFlush()) {
+        if (!BitBlt(memory_, 0, 0, width, height, screen_, rect_.left, rect_.top, SRCCOPY | CAPTUREBLT)) {
             return LastErrorResult();
         }
+        if (includeCursor_) DrawScreenCursor(memory_, rect_);
+        if (!GdiFlush()) return E_FAIL;
         std::transform(bits_, bits_ + output->pixels().size(), output->pixels().begin(),
                        [](std::uint32_t value) { return value | kOpaque; });
     }
@@ -332,6 +348,7 @@ void RegionCaptureSource::Close() noexcept {
     memory_ = screen_ = nullptr;
     stopEvent_ = nullptr;
     thread_ = 0;
+    includeCursor_ = false;
 }
 
 }  // namespace picolet

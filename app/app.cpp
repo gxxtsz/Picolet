@@ -2,6 +2,8 @@
 #include <picolet/capture/image.h>
 #include <picolet/capture/scroll_stitcher.h>
 #include <picolet/desktop/export.h>
+#include <picolet/desktop/gif_clipboard.h>
+#include <picolet/desktop/gif_recording.h>
 #include <picolet/desktop/hotkeys.h>
 #include <picolet/desktop/long_capture.h>
 #include <picolet/desktop/overlay.h>
@@ -30,8 +32,9 @@ constexpr wchar_t kElevatedRestartArgument[] = L"--elevated-restart";
 constexpr UINT kTrayIcon = 1;
 constexpr UINT kTrayMessage = WM_APP + 1;
 constexpr UINT kCaptureRequest = WM_APP + 4;
+constexpr UINT_PTR kGifRecordingTimer = 0x5047;
 enum TrayCommand : UINT { TrayCapture = 2001, TraySettings, TrayExit, TrayRestartElevated };
-enum class Operation { Idle, PendingCapture, Selecting, Scrolling, EditingLong, EditingSettings, Output, Restarting, Exiting };
+enum class Operation { Idle, PendingCapture, Selecting, Scrolling, RecordingGif, EditingLong, EditingSettings, Output, Restarting, Exiting };
 
 void ShowError(HWND owner, const wchar_t* message) noexcept {
     MessageBoxW(owner, message, kTitle, MB_OK | MB_ICONERROR);
@@ -47,7 +50,7 @@ bool IsProcessElevated() noexcept {
     return GetTokenInformation(token.get(), TokenElevation, &elevation, sizeof(elevation), &size) && elevation.TokenIsElevated;
 }
 
-// 隐藏的顶层窗口统一接收托盘、热键与显示变化。冻结帧、会话和输出在同一线程串行管理。
+// 隐藏的顶层窗口统一接收托盘、热键与显示变化。各采集会话在 UI 线程串行切换，后台结果回到此线程发布。
 class App {
 public:
     explicit App(HINSTANCE instance, bool autostart, bool elevated) noexcept
@@ -63,6 +66,7 @@ private:
 
     NOTIFYICONDATAW TrayData() const noexcept;
     bool AddTrayIcon() noexcept;
+    void Notify(const wchar_t* message) noexcept;
     void HandleTrayMessage(WPARAM wparam, LPARAM lparam) noexcept;
     void ShowTrayMenu(POINT anchor) noexcept;
     void ShowSettings() noexcept;
@@ -75,6 +79,10 @@ private:
     // 长截图保留原遮罩直到新编辑器成功打开；取消或创建失败均可恢复原截图。
     void StartLongCapture() noexcept;
     void HandleScrollAction(ScrollAction action) noexcept;
+    // 保留原截图供取消或失败时恢复，成功复制或显示配置失效时结束整个截图会话。
+    void StartGifRecording() noexcept;
+    void UpdateGifRecording() noexcept;
+    void StopGifForDisplayChange() noexcept;
     SelectionOverlay& ActiveEditor() noexcept { return longEditing_ ? longEditor_ : overlay_; }
     void EndCapture(const wchar_t* error = nullptr) noexcept;
 
@@ -95,6 +103,7 @@ private:
     SelectionOverlay overlay_;
     SelectionOverlay longEditor_;
     LongCaptureSession scrolling_;
+    GifRecordingSession gifRecording_;
     DesktopFrame longFrame_;
     RECT longAnchor_{};
     bool longEditing_ = false;
@@ -113,10 +122,12 @@ bool App::Initialize() noexcept {
     definition.hIcon = icon_;
     definition.lpszClassName = kControllerClass;
     if (!RegisterClassExW(&definition) || !SelectionOverlay::Register(instance_, icon_) ||
-        !PinWindows::Register(instance_, icon_) || !LongCaptureSession::Register(instance_, icon_)) return false;
+        !PinWindows::Register(instance_, icon_) || !LongCaptureSession::Register(instance_, icon_) ||
+        !GifRecordingSession::Register(instance_, icon_)) return false;
     // 使用隐藏的顶层窗口。消息专用窗口收不到 Explorer 的托盘重建广播。
     if (!CreateWindowExW(WS_EX_TOOLWINDOW, kControllerClass, kTitle, WS_POPUP,
                          0, 0, 0, 0, nullptr, nullptr, instance_, this)) return false;
+    CleanupGifClipboardFiles();
     if (AddTrayIcon()) return true;
     // 登录启动时 Explorer 可能仍在初始化：保留消息循环异步等待，不阻塞界面线程。
     return autostart_ && SUCCEEDED(trayRetry_.Begin(window_, GetTickCount64()));
@@ -158,6 +169,10 @@ LRESULT App::Handle(UINT message, WPARAM wparam, LPARAM lparam) noexcept {
     }
     switch (message) {
     case WM_TIMER:
+        if (wparam == kGifRecordingTimer && operation_ == Operation::RecordingGif) {
+            UpdateGifRecording();
+            return 0;
+        }
         if (wparam == TrayStartupRetry::kTimer && trayRetry_.waiting()) {
             if (trayRetry_.Attempt(GetTickCount64(), [this]() noexcept { return AddTrayIcon(); }) ==
                 TrayStartupRetry::Result::TimedOut) DestroyWindow(window_);
@@ -183,6 +198,7 @@ LRESULT App::Handle(UINT message, WPARAM wparam, LPARAM lparam) noexcept {
         return 0;
     case WM_DISPLAYCHANGE:
         if (operation_ == Operation::Scrolling) scrolling_.StopForDisplayChange();
+        else if (operation_ == Operation::RecordingGif) StopGifForDisplayChange();
         else if (!longEditing_ && (operation_ == Operation::Selecting || operation_ == Operation::Output)) overlay_.Cancel();
         return 0;
     case WM_ENDSESSION:
@@ -192,6 +208,8 @@ LRESULT App::Handle(UINT message, WPARAM wparam, LPARAM lparam) noexcept {
         operation_ = Operation::Exiting;
         trayRetry_.Stop();
         hotkeys_.Stop();
+        KillTimer(window_, kGifRecordingTimer);
+        gifRecording_.Close();
         overlay_.Close();
         longEditor_.Close();
         scrolling_.Close();
@@ -230,6 +248,16 @@ bool App::AddTrayIcon() noexcept {
         if (!hotkeysStarted_) { hotkeys_.Start(window_); hotkeysStarted_ = true; }
     }
     return trayAdded_;
+}
+
+void App::Notify(const wchar_t* message) noexcept {
+    if (!trayAdded_) return;
+    auto data = TrayData();
+    data.uFlags = NIF_INFO;
+    data.dwInfoFlags = NIIF_INFO | NIIF_NOSOUND;
+    lstrcpynW(data.szInfoTitle, kTitle, static_cast<int>(std::size(data.szInfoTitle)));
+    lstrcpynW(data.szInfo, message, static_cast<int>(std::size(data.szInfo)));
+    Shell_NotifyIconW(NIM_MODIFY, &data);
 }
 
 void App::HandleTrayMessage(WPARAM wparam, LPARAM lparam) noexcept {
@@ -357,6 +385,10 @@ void App::HandleOverlayAction(OverlayAction action) noexcept {
         EndCapture();
         return;
     }
+    if (action == OverlayAction::RecordGif) {
+        if (!longEditing_) StartGifRecording();
+        return;
+    }
     operation_ = Operation::Output;
     editor.BeginOutput();
     // 合成完整尺寸的图像后再交给桌面输出接口。用户取消保存或输出失败时，
@@ -446,7 +478,62 @@ void App::HandleScrollAction(ScrollAction action) noexcept {
     operation_ = Operation::EditingLong;
 }
 
+void App::StartGifRecording() noexcept {
+    const RECT area = overlay_.selection();
+    const auto* display = frame_.FindDisplay(area);
+    if (!display) {
+        overlay_.Retry(L"GIF 录制范围须完整位于同一显示器内，请重新框选。");
+        return;
+    }
+    const auto seed = *display;
+    operation_ = Operation::RecordingGif;
+    overlay_.Suspend();
+    const HRESULT flushed = DwmFlush();
+    if (operation_ != Operation::RecordingGif) return;
+    const HRESULT opened = FAILED(flushed) ? flushed : gifRecording_.Open(instance_, window_, area, seed);
+    if (operation_ != Operation::RecordingGif) {
+        gifRecording_.Close();
+        return;
+    }
+    if (opened == S_FALSE) {
+        StopGifForDisplayChange();
+        return;
+    }
+    if (opened == S_OK && SetTimer(window_, kGifRecordingTimer, 100, nullptr)) return;
+
+    gifRecording_.Close();
+    operation_ = Operation::Selecting;
+    overlay_.Resume(L"无法启动 GIF 录制，请重试。");
+}
+
+void App::UpdateGifRecording() noexcept {
+    const auto result = gifRecording_.Tick();
+    if (result == GifRecordingResult::Pending) return;
+    if (result == GifRecordingResult::DisplayChanged) {
+        StopGifForDisplayChange();
+        return;
+    }
+    if (result == GifRecordingResult::Copied) {
+        EndCapture();
+        Notify(L"GIF 已复制");
+        CleanupGifClipboardFiles();
+        return;
+    }
+    KillTimer(window_, kGifRecordingTimer);
+    gifRecording_.Close();
+    operation_ = Operation::Selecting;
+    overlay_.Resume(result == GifRecordingResult::Failed ? L"GIF 录制失败，请重试。" : nullptr);
+}
+
+void App::StopGifForDisplayChange() noexcept {
+    operation_ = Operation::Output;
+    EndCapture();
+    Notify(L"显示配置已变化，GIF 录制已结束，请重新框选。");
+}
+
 void App::EndCapture(const wchar_t* error) noexcept {
+    KillTimer(window_, kGifRecordingTimer);
+    gifRecording_.Close();
     overlay_.Close();
     longEditor_.Close();
     scrolling_.Close();

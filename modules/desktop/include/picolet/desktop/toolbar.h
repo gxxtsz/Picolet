@@ -14,7 +14,7 @@ namespace picolet {
 
 // 控件顺序即 Tab 顺序。主栏、参数栏和色板中的按钮都由同一个遮罩窗口接收命令。
 enum class ToolbarButton : std::size_t {
-    Select, Reselect, Fullscreen, LongCapture, Shapes, Arrow, Pen, Text, Mosaic, Undo, Redo, Pin, Save, Cancel, Copy,
+    Select, Reselect, Fullscreen, LongCapture, RecordGif, Shapes, Arrow, Pen, Text, Mosaic, Undo, Redo, Pin, Save, Cancel, Copy,
     Rectangle, Ellipse, Line, Outline, Solid, Size, Color, Red, Yellow, Green, Blue, White, Black, Count
 };
 
@@ -43,7 +43,7 @@ struct ToolbarView {
     bool canUndo = false;
     bool canRedo = false;
     bool paletteOpen = false;
-    bool document = false;  // 长图编辑时固定主栏，Select 用作移动视图，隐藏重选、全屏和长截图。
+    bool document = false;  // 长图编辑时固定主栏，Select 用作移动视图，隐藏重选、全屏、长截图和 GIF 录制。
     SIZE imageSize{};       // 文档模式尺寸标签使用原图像素，不随预览缩放。
 };
 

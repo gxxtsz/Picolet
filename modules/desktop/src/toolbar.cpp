@@ -33,7 +33,7 @@ struct ControlSpec {
 
 constexpr std::array<ControlSpec, Index(Button::Count)> kControls{{
     {L"调整选区"}, {L"重选"}, {L"全屏", Shortcut::Fullscreen},
-    {L"长截图", Shortcut::LongCapture},
+    {L"长截图", Shortcut::LongCapture}, {L"录制 GIF"},
     {L"形状"}, {L"箭头"}, {L"画笔"}, {L"文字"}, {L"马赛克"},
     {L"撤销", Shortcut::Undo}, {L"重做", Shortcut::Redo},
     {L"贴图", Shortcut::Pin}, {L"另存为 PNG", Shortcut::Save}, {L"取消", Shortcut::Cancel},
@@ -125,6 +125,12 @@ void Glyph(Graphics& g, Button button, RECT rect, UINT dpi, COLORREF ink, COLORR
         line({{9, 7}, {12, 4}, {15, 7}});
         line({{9, 17}, {12, 20}, {15, 17}});
         break;
+    case Button::RecordGif: {
+        const SolidBrush recording(Opaque(kRed));
+        g.DrawEllipse(&pen, 4, 4, 16, 16);
+        g.FillEllipse(&recording, 8, 8, 8, 8);
+        break;
+    }
     case Button::Shapes:
         line({{6, 16}, {4, 16}, {4, 4}, {16, 4}, {16, 6}});
         g.DrawEllipse(&pen, 9, 9, 12, 12);
@@ -454,7 +460,7 @@ void CaptureToolbar::Layout(const ToolbarArea& workArea, const ToolbarArea& labe
     };
     if (selected) {
         if (view.document) main.Add(boxes[Index(Button::Select)], mainButton);
-        else addGroup(Button::Select, Button::LongCapture, 0);
+        else addGroup(Button::Select, Button::RecordGif, 0);
         addGroup(Button::Shapes, Button::Mosaic, 1);
         addGroup(Button::Undo, Button::Redo, 2);
         addGroup(Button::Pin, Button::Copy, 3);

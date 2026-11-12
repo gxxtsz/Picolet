@@ -203,6 +203,10 @@ LRESULT CALLBACK Proc(HWND window, UINT message, WPARAM wp, LPARAM lp) {
             editor.Retry(L"此入口仅验证普通截图绘制，请返回测试入口开始长截图。");
             return 0;
         }
+        if (action == OverlayAction::RecordGif) {
+            editor.Retry(L"请在 Picolet 主程序中验证 GIF 录制。");
+            return 0;
+        }
         if (action != OverlayAction::Cancel) {
             if (!documentMode) anchor = editor.selection();
             Image image; editor.BeginOutput();

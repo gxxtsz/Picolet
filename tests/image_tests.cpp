@@ -1,4 +1,5 @@
 #include <picolet/capture/capture_edit.h>
+#include <picolet/capture/gif.h>
 #include <picolet/capture/png_export.h>
 #include <picolet/desktop/hotkeys.h>
 #include "hdr_color.h"
@@ -442,6 +443,90 @@ void TestPng() {
           "保存后遗留了临时文件");
 }
 
+bool HasGifShort(IWICMetadataQueryReader& reader, const wchar_t* path, USHORT expected) {
+    PROPVARIANT value{};
+    const HRESULT status = reader.GetMetadataByName(path, &value);
+    const bool match = SUCCEEDED(status) && value.vt == VT_UI2 && value.uiVal == expected;
+    PropVariantClear(&value);
+    return match;
+}
+
+void TestGif() {
+    constexpr int width = 3, height = 2;
+    constexpr std::array colors{
+        std::array{0xffff0000u, 0xff00ff00u, 0xff0000ffu, 0xff00ff00u, 0xff0000ffu, 0xffff0000u},
+        std::array{0xff0000ffu, 0xffffff00u, 0xff0000ffu, 0xffffff00u, 0xff0000ffu, 0xffffff00u},
+        std::array{0xff00ff00u, 0xff00ff00u, 0xff00ff00u, 0xff00ff00u, 0xff00ff00u, 0xff00ff00u}
+    };
+    constexpr std::array<USHORT, colors.size()> delays{10, 27, 1};
+    GifEncoder encoder;
+    Image image;
+    std::vector<std::uint8_t> bytes{0x55};
+    Check(encoder.Open(65536, height) == E_INVALIDARG, "GIF 接受了超出 16 位范围的画布");
+    Check(SUCCEEDED(encoder.Open(width, height)), "无法创建 GIF 编码器");
+    Check(FAILED(encoder.Finish(bytes)) && bytes.size() == 1 && bytes.front() == 0x55,
+          "无帧 GIF 覆盖了已有输出");
+    Check(encoder.AppendFrame(image, 10) == E_INVALIDARG, "GIF 接受了空帧");
+    Check(SUCCEEDED(image.Resize(width, height)), "无法分配 GIF 测试帧");
+    Check(encoder.AppendFrame(image, 0) == E_INVALIDARG, "GIF 接受了无效帧时长");
+    for (std::size_t index = 0; index < colors.size(); ++index) {
+        std::ranges::copy(colors[index], image.pixels().begin());
+        const auto before = encoder.encoded_size();
+        Check(SUCCEEDED(encoder.AppendFrame(image, delays[index])) && encoder.encoded_size() > before,
+              "提交 GIF 帧后未增长输出流");
+    }
+    Check(SUCCEEDED(encoder.Finish(bytes)) && bytes.back() == 0x3b, "GIF 未写入结束标记");
+
+    ComPtr<IWICImagingFactory> factory;
+    ComPtr<IWICStream> stream;
+    ComPtr<IWICBitmapDecoder> decoder;
+    Check(SUCCEEDED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                     IID_PPV_ARGS(factory.put()))), "无法创建 GIF 解码组件");
+    Check(SUCCEEDED(factory->CreateStream(stream.put())) &&
+          SUCCEEDED(stream->InitializeFromMemory(bytes.data(), static_cast<DWORD>(bytes.size()))) &&
+          SUCCEEDED(factory->CreateDecoderFromStream(stream.get(), nullptr, WICDecodeMetadataCacheOnLoad, decoder.put())),
+          "无法解码 GIF 输出流");
+    GUID container{};
+    UINT count = 0;
+    Check(SUCCEEDED(decoder->GetContainerFormat(&container)) && IsEqualGUID(container, GUID_ContainerFormatGif) &&
+          SUCCEEDED(decoder->GetFrameCount(&count)) && count == colors.size(), "GIF 容器格式或帧数错误");
+    ComPtr<IWICMetadataQueryReader> metadata;
+    Check(SUCCEEDED(decoder->GetMetadataQueryReader(metadata.put())), "无法读取 GIF 全局元数据");
+    Check(HasGifShort(*metadata.get(), L"/logscrdesc/Width", width) &&
+          HasGifShort(*metadata.get(), L"/logscrdesc/Height", height), "GIF 画布尺寸错误");
+
+    constexpr std::array<BYTE, 11> netscape{'N', 'E', 'T', 'S', 'C', 'A', 'P', 'E', '2', '.', '0'};
+    PROPVARIANT value{};
+    auto status = metadata->GetMetadataByName(L"/appext/Application", &value);
+    const bool hasLoop = SUCCEEDED(status) && value.vt == (VT_VECTOR | VT_UI1) && value.caub.pElems &&
+                         std::ranges::equal(std::span(value.caub.pElems, value.caub.cElems), netscape);
+    PropVariantClear(&value);
+    Check(hasLoop, "GIF 缺少循环应用扩展");
+    status = metadata->GetMetadataByName(L"/appext/Data", &value);
+    constexpr std::array<BYTE, 4> loopForever{3, 1, 0, 0};
+    const bool infinite = SUCCEEDED(status) && value.vt == (VT_VECTOR | VT_UI1) && value.caub.pElems &&
+                          value.caub.cElems >= loopForever.size() &&
+                          std::ranges::equal(std::span(value.caub.pElems, loopForever.size()), loopForever);
+    PropVariantClear(&value);
+    Check(infinite, "GIF 循环次数不是无限");
+
+    for (UINT index = 0; index < count; ++index) {
+        ComPtr<IWICBitmapFrameDecode> frame;
+        ComPtr<IWICFormatConverter> converter;
+        UINT w = 0, h = 0;
+        Check(SUCCEEDED(decoder->GetFrame(index, frame.put())) && SUCCEEDED(frame->GetSize(&w, &h)) &&
+              w == width && h == height, "GIF 帧尺寸错误");
+        Check(SUCCEEDED(frame->GetMetadataQueryReader(metadata.put())) &&
+              HasGifShort(*metadata.get(), L"/grctlext/Delay", delays[index]), "GIF 帧时长错误");
+        Check(SUCCEEDED(factory->CreateFormatConverter(converter.put())) &&
+              SUCCEEDED(converter->Initialize(frame.get(), GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone,
+                                               nullptr, 0, WICBitmapPaletteTypeCustom)), "无法转换 GIF 帧像素");
+        Check(SUCCEEDED(converter->CopyPixels(nullptr, image.stride(), image.byte_size(),
+                                              reinterpret_cast<BYTE*>(image.pixels().data()))) &&
+              std::ranges::equal(image.pixels(), colors[index]), "GIF 帧的本地色表或像素顺序错误");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -462,6 +547,7 @@ int main() {
         TestShapeAnnotations();
         TestShortcuts();
         TestPng();
+        TestGif();
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         status = 1;
